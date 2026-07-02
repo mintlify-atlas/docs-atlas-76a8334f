@@ -1,72 +1,96 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "Sentinel SoftServe",
+  "theme": "aspen",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#9ca4a4",
+    "light": "#383c40",
+    "dark": "#d5d5d6"
   },
-  "favicon": "/favicon.svg",
-  "navigation": {
-    "pages": [
-      {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "quickstart"
-        ]
-      }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
+  "favicon": "https://media.brand.dev/30fc5573-41e4-44d8-8bc5-8effaab80eec.jpg",
   "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
     "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "type": "github",
+      "href": "https://github.com/nicolas344/Sentinel-SoftServe"
     }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/nicolas344/Sentinel-SoftServe"
     }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Deployment",
+            "pages": [
+              "deployment/docker-compose",
+              "deployment/configuration",
+              "deployment/database-setup",
+              "deployment/runbook-seeding"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/incident-lifecycle",
+              "concepts/multi-agent-pipeline",
+              "concepts/guardrails",
+              "concepts/memory-rag"
+            ]
+          },
+          {
+            "group": "Supported Runtimes",
+            "pages": [
+              "runtimes/docker",
+              "runtimes/podman",
+              "runtimes/kubernetes",
+              "runtimes/postgresql"
+            ]
+          },
+          {
+            "group": "Using the Dashboard",
+            "pages": [
+              "dashboard/overview",
+              "dashboard/incidents",
+              "dashboard/approvals",
+              "dashboard/post-mortem"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "api/overview",
+              "api/authentication"
+            ]
+          },
+          {
+            "group": "Endpoints",
+            "pages": [
+              "api/incidents",
+              "api/actions",
+              "api/alerts",
+              "api/health"
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

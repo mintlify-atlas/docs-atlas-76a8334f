@@ -1,0 +1,249 @@
+---
+title: "Alerts Webhook: Receive Prometheus Alertmanager Notifications"
+sidebarTitle: "Alerts"
+description: "How to configure Alertmanager to POST to Sentinel's /api/alerts webhook. Covers the webhook payload schema, authentication with ALERT_WEBHOOK_SECRET, and incident creation flow."
+---
+
+The Alerts webhook is the primary integration point between your Prometheus Alertmanager deployment and Sentinel SoftServe. When Alertmanager fires an alert, it POSTs the standard webhook payload to `/api/alerts`. Sentinel processes each `firing` alert, creates an incident in Supabase, and immediately kicks off the LangGraph agent pipeline as a background task. This page covers authentication, payload schema, label conventions, and an Alertmanager configuration example.
+
+## POST /api/alerts
+
+Receive a Prometheus Alertmanager webhook notification and create incidents for all `firing` alerts in the payload.
+
+**Auth required:** No (Supabase JWT not used). Protected by `ALERT_WEBHOOK_SECRET` when configured.
+
+### Authentication
+
+This endpoint uses a **shared webhook secret** rather than user JWTs. Set the `ALERT_WEBHOOK_SECRET` environment variable on the backend and configure the same value in your `alertmanager.yml`. Alertmanager sends it as:
+
+```
+Authorization: Bearer <ALERT_WEBHOOK_SECRET>
+```
+
+The backend compares the provided value using `hmac.compare_digest` to prevent timing attacks.
+
+<Warning>
+  If `ALERT_WEBHOOK_SECRET` is not set, the endpoint accepts all incoming requests with no authentication. This is intended for local development only. **Always configure this secret before exposing Sentinel to the internet.**
+</Warning>
+
+### Payload Schema
+
+Sentinel accepts the standard Alertmanager webhook payload format (version 4):
+
+```json
+{
+  "version": "4",
+  "status": "firing",
+  "receiver": "sentinel",
+  "groupKey": "{}:{alertname=\"ContainerDown\"}",
+  "groupLabels": {},
+  "commonLabels": {},
+  "commonAnnotations": {},
+  "externalURL": "http://alertmanager:9093",
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "ContainerDown",
+        "container": "my-service",
+        "source_type": "container",
+        "container_runtime": "docker"
+      },
+      "annotations": {},
+      "startsAt": "2024-01-01T00:00:00Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "http://prometheus:9090/graph?...",
+      "fingerprint": "abc123"
+    }
+  ]
+}
+```
+
+### Alert Labels
+
+Sentinel reads the following labels from each individual alert to determine the incident type and which agent to run:
+
+<ParamField body="alerts[].labels.source_type" type="string">
+  Determines the triage path. Use `container` for Docker/Podman/Kubernetes workloads and `database` for PostgreSQL incidents. Defaults to `container` if not set.
+</ParamField>
+
+<ParamField body="alerts[].labels.container_runtime" type="string">
+  Specifies the container runtime: `docker`, `podman`, or `kubernetes`. Determines which execution branch the action agent uses.
+</ParamField>
+
+<ParamField body="alerts[].labels.namespace" type="string">
+  Kubernetes namespace. Used when constructing `kubectl` commands for namespace-scoped resources.
+</ParamField>
+
+<ParamField body="alerts[].labels.alertname" type="string">
+  The Prometheus alert rule name. Used to classify the incident type (e.g. `ContainerDown`, `HighMemoryUsage`).
+</ParamField>
+
+<ParamField body="alerts[].labels.container" type="string">
+  Name of the affected container. Used as the `target` field on the created incident.
+</ParamField>
+
+<ParamField body="alerts[].status" type="string">
+  Only `firing` alerts result in incident creation. `resolved` alerts are acknowledged but do not create incidents.
+</ParamField>
+
+### Incident Creation Flow
+
+<Steps>
+  <Step title="Authenticate">
+    The webhook secret is validated via `hmac.compare_digest`. Unauthenticated requests are rejected with `401 Unauthorized`.
+  </Step>
+  <Step title="Process each alert">
+    For every alert in the `alerts` array, `process_prometheus_alert()` is called. This function extracts the target, severity, title, and container runtime from the alert labels.
+  </Step>
+  <Step title="Create incident in Supabase">
+    A new incident row is inserted with `status = "detected"` and all extracted fields. Only `firing` alerts create incidents.
+  </Step>
+  <Step title="Launch LangGraph engine">
+    The LangGraph analysis pipeline is added as a `BackgroundTask`, passing the incident ID, target, logs, severity, title, and labels. The HTTP response is returned immediately without waiting for the pipeline to complete.
+  </Step>
+</Steps>
+
+### Response
+
+```json
+{
+  "message": "Alertas procesadas",
+  "count": 2
+}
+```
+
+`count` reflects the total number of alerts in the payload (both `firing` and non-`firing`). The endpoint always returns `200 OK` as long as the webhook secret is valid.
+
+---
+
+## Alertmanager Configuration
+
+Add Sentinel as a webhook receiver in your `alertmanager.yml`. Use the `http_config.authorization` block to pass the shared secret.
+
+```yaml
+# alertmanager/alertmanager.yml
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: sentinel
+  group_wait: 10s
+  group_interval: 5m
+  repeat_interval: 1h
+
+receivers:
+  - name: sentinel
+    webhook_configs:
+      - url: 'http://backend:8000/api/alerts'
+        send_resolved: false
+        http_config:
+          authorization:
+            credentials: 'sentinel-webhook-secret-change-me'
+```
+
+<Note>
+  The value of `credentials` in `alertmanager.yml` must exactly match the `ALERT_WEBHOOK_SECRET` environment variable set on the Sentinel backend container.
+</Note>
+
+### Alert Rules with Sentinel Labels
+
+For best results, include `source_type` and `container_runtime` labels directly in your Prometheus alert rules so Sentinel can route them to the correct agent:
+
+```yaml
+# prometheus/rules/containers.yml
+groups:
+  - name: container_alerts
+    rules:
+      - alert: ContainerDown
+        expr: absent(container_last_seen{name="my-service"})
+        for: 30s
+        labels:
+          severity: critical
+          source_type: container
+          container_runtime: docker
+          container: my-service
+        annotations:
+          summary: "Container my-service is not running"
+
+      - alert: HighMemoryUsage
+        expr: |
+          container_memory_usage_bytes{name="api-gateway"}
+            / container_spec_memory_limit_bytes{name="api-gateway"} > 0.9
+        for: 1m
+        labels:
+          severity: high
+          source_type: container
+          container_runtime: docker
+          container: api-gateway
+        annotations:
+          summary: "api-gateway memory usage above 90%"
+```
+
+### Kubernetes Example
+
+For Kubernetes workloads, include `namespace` in the alert labels:
+
+```yaml
+      - alert: PodCrashLooping
+        expr: rate(kube_pod_container_status_restarts_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: high
+          source_type: container
+          container_runtime: kubernetes
+          namespace: production
+        annotations:
+          summary: "Pod {{ $labels.pod }} is crash looping"
+```
+
+### PostgreSQL Example
+
+For database incidents, set `source_type: database`:
+
+```yaml
+      - alert: PostgresHighConnections
+        expr: pg_stat_database_numbackends / pg_settings_max_connections > 0.8
+        for: 5m
+        labels:
+          severity: high
+          source_type: database
+        annotations:
+          summary: "PostgreSQL connection count exceeds 80% of max_connections"
+```
+
+---
+
+## Testing the Webhook Locally
+
+Send a test payload to your local Sentinel instance using curl:
+
+```bash
+curl -X POST http://localhost:8000/api/alerts \
+  -H "Authorization: Bearer sentinel-webhook-secret-change-me" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "version": "4",
+    "status": "firing",
+    "receiver": "sentinel",
+    "alerts": [
+      {
+        "status": "firing",
+        "labels": {
+          "alertname": "ContainerDown",
+          "container": "my-service",
+          "source_type": "container",
+          "container_runtime": "docker"
+        },
+        "annotations": {},
+        "startsAt": "2024-01-01T00:00:00Z"
+      }
+    ]
+  }'
+```
+
+Expected response:
+
+```json
+{"message": "Alertas procesadas", "count": 1}
+```

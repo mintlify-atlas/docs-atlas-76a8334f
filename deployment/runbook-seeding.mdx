@@ -1,0 +1,128 @@
+---
+title: "Seed ChromaDB with Domain Runbooks"
+sidebarTitle: "Runbook Seeding"
+description: "Populate ChromaDB vector collections with domain-specific runbooks so Sentinel's agents can retrieve relevant remediation procedures during incident investigation."
+---
+
+Runbook seeding is the process of loading Markdown-formatted operational runbooks into ChromaDB as vector embeddings. During incident investigation, Sentinel's specialist agents query these collections using semantic similarity search — a technique called Retrieval-Augmented Generation (RAG) — to retrieve the most relevant remediation procedure for the incident at hand. Without seeding, the agents have no domain-specific runbook knowledge and will fall back on general LLM reasoning only.
+
+<Warning>
+ChromaDB must be running before you execute any seeding script. Start it with:
+
+```bash
+docker compose up -d chromadb
+```
+
+Wait a few seconds for the container to finish initializing before running the scripts.
+</Warning>
+
+<Note>
+Runbook seeding is a **one-time operation**. You only need to re-run the scripts if you add, update, or remove runbook content. The ChromaDB `chroma_data` named volume persists the collections across container restarts — you do not need to re-seed every time you restart the stack.
+</Note>
+
+## ChromaDB collections
+
+Each seeding script targets a dedicated collection namespaced by domain. This mirrors the multi-agent architecture, where each specialist agent queries only its own collection:
+
+| Script | Collection | Domain | Runbook types loaded |
+|---|---|---|---|
+| `seed_chromadb.py` | `runbooks-docker` | Docker | `oom`, `app_crash`, `config_error`, `dependency_failure`, `memory_pressure`, `cpu_throttling`, `restart_loop`, `network_error`, `disk_pressure`, `unknown` |
+| `seed_postgres_runbooks.py` | `runbooks-postgres` | PostgreSQL | `connection_exhaustion`, `long_running_transaction`, `deadlock`, `replication_lag`, `low_cache_hit`, `database_growth` |
+| `seed_podman_runbooks.py` | `runbooks-podman` | Podman | `app_crash`, `oom`, `high_memory`, `restart_loop`, `config_error`, `dependency_failure` |
+| `seed_kubernetes_runbooks.py` | `runbooks-kubernetes` | Kubernetes | `app_crash` (CrashLoopBackOff), `oom` (OOMKilled), `dependency_failure` (ImagePullBackOff), `disk_pressure` (Pending), `network_error` (NodeNotReady), `dependency_failure` (replica mismatch) |
+
+## Run the seeding scripts
+
+<Steps>
+  <Step title="Activate the Python virtualenv">
+    The scripts use the same dependencies as the backend. Activate the virtualenv before running them:
+
+    ```bash
+    cd Backend
+    python3 -m venv env          # only needed once, if you have not set it up yet
+    source env/bin/activate      # macOS / Linux
+    # env\Scripts\activate       # Windows
+    pip install -r requirements.txt  # only needed once
+    ```
+  </Step>
+
+  <Step title="Seed all four collections">
+    Run each script from the `Backend/` directory:
+
+    ```bash
+    python scripts/seed_chromadb.py
+    python scripts/seed_postgres_runbooks.py
+    python scripts/seed_podman_runbooks.py
+    python scripts/seed_kubernetes_runbooks.py
+    ```
+
+    Each script prints a confirmation line when it finishes:
+
+    ```
+    ✓ 10 runbooks cargados en 'runbooks-docker' (http://localhost:8001).
+    ✓ 6 runbooks cargados en 'runbooks-postgres' (http://localhost:8001).
+    ✓ 6 runbooks cargados en 'runbooks-podman' (http://localhost:8001).
+    ✓ 6 runbooks de Kubernetes indexados en 'runbooks-kubernetes'.
+    ```
+  </Step>
+
+  <Step title="Verify the collections">
+    You can confirm the collections were created by querying the ChromaDB API directly:
+
+    ```bash
+    curl -s http://localhost:8001/api/v1/collections | python3 -m json.tool
+    ```
+
+    You should see four entries: `runbooks-docker`, `runbooks-postgres`, `runbooks-podman`, and `runbooks-kubernetes`.
+  </Step>
+</Steps>
+
+## How the scripts work
+
+Each script connects to ChromaDB using `CHROMA_HOST` from `Backend/.env` (defaulting to `http://localhost:8001`), deletes any previously existing collection with the same name (so re-seeding is always a clean slate), creates a fresh collection, and calls `collection.add()` with the runbook text as documents, a unique string ID, and metadata including the incident `type` and `domain`.
+
+ChromaDB automatically generates vector embeddings from the runbook text using the default ONNX embedding model (cached to the `chroma_cache` volume after the first download). At query time, the agent converts the incident's log text and classified type to a vector and retrieves the top-k most similar runbooks from the relevant collection.
+
+<CodeGroup>
+```python seed_chromadb.py (excerpt)
+COLLECTION_NAME = "runbooks-docker"
+
+collection.add(
+    documents=[r["text"] for r in RUNBOOKS],
+    ids=[r["id"] for r in RUNBOOKS],
+    metadatas=[{"type": r["type"], "domain": "docker"} for r in RUNBOOKS],
+)
+```
+
+```python seed_kubernetes_runbooks.py (excerpt)
+COLLECTION_NAME = "runbooks-kubernetes"
+
+collection = client.create_collection(
+    name=COLLECTION_NAME,
+    metadata={"hnsw:space": "cosine"},  # cosine similarity for semantic search
+)
+
+collection.add(ids=ids, documents=docs, metadatas=metas)
+```
+</CodeGroup>
+
+## Episodic memory collections
+
+In addition to the static runbook collections seeded above, Sentinel automatically creates and populates **episodic memory** collections as incidents are resolved. These collections follow the naming convention `incidents-{domain}`:
+
+| Collection | Populated by | Contents |
+|---|---|---|
+| `incidents-docker` | `DockerAgent` (Lab 5) | Summaries of resolved Docker incidents — what happened, what was done, and the outcome |
+| `incidents-postgres` | `PostgresAgent` (Lab 5) | Resolved PostgreSQL incident memory |
+| `incidents-podman` | `PodmanAgent` (Lab 5) | Resolved Podman incident memory |
+| `incidents-kubernetes` | `KubernetesAgent` (Lab 5) | Resolved Kubernetes incident memory |
+
+Episodic memory collections are created automatically and do not require manual seeding. The agents query them alongside the runbook collections during investigation, giving Sentinel awareness of similar past incidents and how they were resolved.
+
+<Tip>
+After your first successful incident resolution, verify the episodic memory collection was populated:
+
+```bash
+curl -s http://localhost:8001/api/v1/collections | python3 -m json.tool | grep incidents
+```
+</Tip>

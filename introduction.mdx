@@ -1,0 +1,90 @@
+---
+title: "Sentinel SoftServe: AI Copilot for DevOps Incident Triage"
+sidebarTitle: "Introduction"
+description: "Sentinel is a self-hosted agentic AI co-pilot that automates DevOps incident triage across Docker, Podman, Kubernetes, and PostgreSQL with human-in-the-loop approvals."
+---
+
+Sentinel SoftServe is an agentic AI co-pilot designed for DevOps and SRE engineers who need to move fast during production incidents. It watches your infrastructure continuously, automatically detects crashes, resource exhaustion, and service degradations, then orchestrates a full triage pipeline — from log collection and root-cause analysis to proposing a safe corrective action — all without requiring you to dig through dashboards manually. Every AI decision passes through a human-in-the-loop approval gate before any remediation command is executed on your infrastructure.
+
+The project is an academic industry collaboration between **Universidad EAFIT** and **SoftServe**, deployed live at [sentinel-softserve-1.onrender.com](https://sentinel-softserve-1.onrender.com).
+
+## The problem Sentinel solves
+
+Modern containerised workloads generate thousands of metrics and log lines per minute. When something goes wrong at 2 a.m., engineers waste critical minutes correlating Prometheus alerts with Loki logs, reading runbooks, and deciding whether to restart a container or roll back a deployment. Sentinel eliminates that toil by:
+
+- **Automatically ingesting alerts** from Alertmanager the moment Prometheus fires a rule.
+- **Fetching and analysing logs** from Loki against a ChromaDB runbook knowledge base.
+- **Classifying the incident** type and routing it to the right specialist agent (Docker, Podman, Kubernetes, or PostgreSQL).
+- **Proposing one safe, whitelisted command** for human approval — never executing anything autonomously.
+- **Generating a post-mortem** and writing the incident into episodic memory so future triage gets smarter.
+
+## Tech stack
+
+Sentinel is built from purpose-chosen components across every layer of the stack.
+
+| Layer | Technology |
+|---|---|
+| Frontend | React 19 + Vite 7 + Tailwind CSS v4 + shadcn/ui |
+| Backend | FastAPI + Uvicorn |
+| AI Orchestration | LangGraph + LangChain |
+| LLM | OpenAI gpt-4o-mini |
+| Knowledge Base | ChromaDB (runbooks RAG + episodic memory) |
+| Auth & Database | Supabase (email/password, JWT, Realtime subscriptions) |
+| Agent Observability | LangFuse v2 (self-hosted) |
+| Incident Detection | cAdvisor + Prometheus + Alertmanager |
+| Log Collection | Loki + Promtail |
+| Dashboards | Grafana |
+
+## Supported runtimes
+
+Sentinel ships a dedicated specialist agent for each supported runtime. Each agent carries its own tool palette and ChromaDB runbook collection so investigations stay tightly scoped.
+
+| Runtime | Agent | Tools |
+|---|---|---|
+| Docker | DockerAgent | `docker_inspect`, `docker_logs`, `docker_stats`, `docker_ps` |
+| Podman | PodmanAgent | `podman_inspect`, `podman_logs`, `podman_stats`, `podman_ps` |
+| Kubernetes | KubernetesAgent | `get_pod_status`, `describe_pod`, `get_pod_logs`, `get_pod_events`, `get_deployment_status`, `list_failing_pods` |
+| PostgreSQL | PostgresAgent | `pg_stat_activity`, `pg_stat_database`, `pg_stat_replication`, `pg_locks` |
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card
+    title="Quickstart"
+    icon="rocket"
+    href="/quickstart"
+  >
+    Run Sentinel locally in under 10 minutes with Docker Compose.
+  </Card>
+  <Card
+    title="Architecture"
+    icon="diagram-project"
+    href="/architecture"
+  >
+    Understand the LangGraph agent pipeline and observability stack.
+  </Card>
+  <Card
+    title="Supported Runtimes"
+    icon="server"
+    href="/runtimes/docker"
+  >
+    Deep-dive into each specialist agent and its tool set.
+  </Card>
+  <Card
+    title="API Reference"
+    icon="code"
+    href="/api/overview"
+  >
+    Explore the FastAPI endpoints that power the dashboard and webhooks.
+  </Card>
+</CardGroup>
+
+<Note>
+  **Prerequisites before you begin:**
+
+  - [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running
+  - [Node.js 20+](https://nodejs.org/)
+  - [Python 3.9+](https://www.python.org/)
+  - A Supabase project with a URL, service-role key, anon key, and JWT secret
+  - An OpenAI API key (gpt-4o-mini access required)
+</Note>

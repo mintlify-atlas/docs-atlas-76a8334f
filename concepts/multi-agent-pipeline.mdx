@@ -1,0 +1,265 @@
+---
+title: "LangGraph Multi-Agent Pipeline: How Sentinel Triages Incidents"
+sidebarTitle: "Agent Pipeline"
+description: "Deep-dive into Sentinel's five-stage LangGraph pipeline: input guardrails, classification, specialist investigation, decision planning, action execution, and post-mortem generation."
+---
+
+When Sentinel receives an alert, it does not hand it to a single monolithic LLM. Instead, it routes the incident through a structured multi-agent pipeline built on LangGraph — each stage has a dedicated responsibility, defined inputs and outputs, and its own guardrail checkpoint. The result is a traceable, auditable triage process where every decision can be explained and every LLM call is logged to LangFuse.
+
+## Pipeline Overview
+
+```
+Alert / Manual Incident
+        │
+        ▼
+┌─────────────────────────┐
+│  Guardrail Input         │  truncate logs, detect prompt injection
+│  (rules → LLM judge)    │
+└──────────┬──────────────┘
+           │ sanitized logs
+           ▼
+┌─────────────────────────┐
+│  Lab 1 — Alert Intake   │  gpt-4o-mini classifies into 1 of 10 types
+│  (_classify)            │  + classification guardrail
+└──────────┬──────────────┘
+           │ incident_type, reasoning
+           ▼
+┌─────────────────────────┐
+│  Lab 2 — Investigation  │  specialist agent (Docker/Podman/K8s/Postgres)
+│  (DomainAgent)          │  tool calls + RAG runbooks + episodic memory
+└──────────┬──────────────┘
+           │ InvestigationResult
+           ▼
+┌─────────────────────────┐
+│  Guardrail Output        │  scope check: stays in DevOps domain?
+│  (rules → LLM judge)    │  (rules → LLM judge)
+└──────────┬──────────────┘
+           │ validated analysis
+           ▼
+┌─────────────────────────┐
+│  Lab 3 — Decision &     │  build whitelisted proposed_action
+│  Planning               │  + action guardrail re-validation
+└──────────┬──────────────┘
+           │ proposed_action (or null)
+           ▼
+┌─────────────────────────┐
+│  Lab 4 — Action &       │  engineer approves → atomic execution
+│  Verification           │  → health check
+└──────────┬──────────────┘
+           │ resolved
+           ▼
+┌─────────────────────────┐
+│  Lab 5 — Post-Incident  │  LLM post-mortem + ChromaDB episodic write
+└─────────────────────────┘
+```
+
+## Data Contracts
+
+Before exploring each stage, it helps to understand the two core data structures that flow through the pipeline.
+
+### `IncidentContext`
+
+Constructed once in `run_langgraph_engine` and passed immutably to every downstream stage and agent:
+
+```python
+@dataclass
+class IncidentContext:
+    incident_id: str
+    title:       str
+    target:      str          # container name, db instance, k8s resource
+    severity:    str          # critical | high | medium | low
+    logs:        str          # sanitized by input guardrail
+    incident_type: Optional[str] = None   # filled after Lab 1
+    labels:      dict = field(default_factory=dict)
+    # labels carries routing metadata:
+    # { "container_runtime": "kubernetes", "source_type": "container",
+    #   "namespace": "production" }
+```
+
+### `InvestigationResult`
+
+Returned by every `DomainAgent.investigate()` call:
+
+```python
+@dataclass
+class InvestigationResult:
+    analysis:              str          # markdown reasoning for the dashboard
+    tool_calls:            list[ToolCall]
+    similar_past_incidents: list[dict]  # from ChromaDB episodic memory
+```
+
+Each `ToolCall` records the tool `name`, `args`, and a `result_preview` (first ~500 chars) that is persisted in Supabase alongside the incident.
+
+---
+
+## Pipeline Stages
+
+<Steps>
+
+### Guardrail Input — Rules + LLM Judge
+
+Before any LLM sees the alert, the input guardrail runs as a two-node LangGraph subgraph defined in `guardrail_graph.py`:
+
+```
+START → rules_node → (conditional) → llm_judge_node → END
+                                 └──── skip (empty text) ──► END
+```
+
+**Rules node** (`guardrails.check_input`):
+- Truncates logs to 4,000 characters — anything beyond that is noise and an injection surface
+- Scans title and logs for 8 prompt injection patterns using compiled regex
+- Suspicious lines are **neutralized** (replaced with `[LÍNEA NEUTRALIZADA POR GUARDRAIL — posible inyección]`) rather than aborting the triage — the incident still needs to be investigated
+
+**LLM judge node** (`llm_guardrail.judge`):
+- Sends up to 3,000 characters of sanitized text to `gpt-4o-mini` with a fixed system prompt
+- Returns `{ safe, on_topic, reason }` in JSON mode
+- **Fail-open**: if OpenAI is unreachable, the judge defaults to `safe=true` — a downed guardrail never blocks a real incident
+- If the LLM flags manipulation, the sanitized output is replaced entirely with `[CONTENIDO BLOQUEADO POR GUARDRAIL SEMÁNTICO]`
+
+The supervisor updates `ctx.logs` with the sanitized output before proceeding.
+
+### Lab 1 — Alert Intake
+
+**Location:** `supervisor.py` → `_classify()`
+
+The classification stage uses `gpt-4o-mini` in JSON mode with `temperature=0` to map the incident to exactly one of the ten canonical incident types:
+
+```python
+model_kwargs={"response_format": {"type": "json_object"}}
+# Prompt instructs: respond ONLY with valid JSON:
+# {"incident_type": "<category>", "reasoning": "<max 2 sentences>"}
+```
+
+The LLM receives: the incident title, target, severity, and the first 800 characters of logs as a preview.
+
+After the LLM responds, the **classification guardrail** (`guardrails.check_incident_type`) validates the returned type against the allowed set. If the LLM hallucinated a category outside the ten valid types, it is silently forced to `unknown`. This prevents any downstream frontend breakage.
+
+The incident status advances to `investigating` and `incident_type` + initial `agent_reasoning` are written to Supabase.
+
+### Lab 2 — Investigation
+
+**Location:** Agent selected by `registry.find_agent_for(ctx)`
+
+The supervisor calls `find_agent_for(ctx)`, which iterates registered agents and returns the first whose `matches(ctx)` returns `True`. The registry currently supports four specialist agents:
+
+<CardGroup cols={2}>
+  <Card title="DockerAgent" icon="docker">
+    Handles `container_runtime: docker`. Tools: inspect, logs, stats, top, diff.
+  </Card>
+  <Card title="PodmanAgent" icon="cube">
+    Handles `container_runtime: podman`. Tools: inspect, logs, pod ps, stats.
+  </Card>
+  <Card title="KubernetesAgent" icon="dharmachakra">
+    Handles `container_runtime: kubernetes`. Tools: kubectl describe, logs, get events, top pods.
+  </Card>
+  <Card title="PostgresAgent" icon="database">
+    Handles `source_type: database`. Tools: pg_stat_activity, pg_stat_bgwriter, query analysis.
+  </Card>
+</CardGroup>
+
+Each agent's `investigate()` method follows this sequence:
+
+1. **Runbook retrieval** — `recall_runbooks(query="{incident_type} {title}", k=5)` fetches the most relevant procedure documents from the `runbooks-{domain}` ChromaDB collection
+2. **Episodic memory query** — `recall_similar_incidents(query, k=6)` retrieves past incidents with cosine distance ≤ 1.5 from the `incidents-{domain}` collection
+3. **Tool execution loop** — the agent's LLM reasons over runbooks, past incidents, and current context, then invokes read-only tools as needed
+4. **Analysis synthesis** — produces markdown `analysis` stored in `InvestigationResult`
+
+After the agent returns, the **output guardrail** (`guardrail_graph.run_output_guardrail`) runs the same two-node graph to check that the analysis stays within the DevOps domain and is not suspiciously short (< 20 characters). Off-topic content gets a warning banner prepended rather than being blocked.
+
+### Lab 3 — Decision & Planning
+
+**Location:** `supervisor.py` → `_build_proposed_action()`
+
+The supervisor deterministically generates a safe remediation command based on `incident_type`, `source_type`, `container_runtime`, and `target`. No LLM is used here — the logic is a pure decision tree that produces whitelisted commands only:
+
+```python
+# Examples of what _build_proposed_action produces:
+"docker restart api-gateway"
+"podman logs payment-service"
+"kubectl rollout restart deployment/auth-service -n production"
+"kubectl delete pod crashlooping-pod-7f9b -n default"
+"pg_terminate_backend mydb"
+"pg_stat_activity mydb"
+```
+
+The proposed action is then independently re-validated by `guardrails.check_proposed_action()`. This is defense-in-depth: even if `_build_proposed_action` were modified to produce something unexpected, or a future agent proposed a custom action, the guardrail catches it before it reaches the engineer. Shell metacharacters (`;`, `&&`, `||`, `|`, `` ` ``, `$(`, `>`, `<`) trigger an immediate block regardless of pattern matching.
+
+If the action passes, the incident advances to `awaiting_approval` and `proposed_action` is stored in Supabase.
+
+### Lab 4 — Action & Verification
+
+**Location:** Action execution and verification modules
+
+When an engineer clicks **Approve** in the dashboard:
+
+1. An atomic DB claim marks the incident as `executing_solution` — this prevents double-execution if the engineer clicks twice or two browser tabs are open simultaneously
+2. The whitelisted command is dispatched to the appropriate runtime executor
+3. The incident moves to `verifying`
+4. A health verification check runs — it inspects the container/pod/database to confirm recovery
+5. On success: status → `resolved`, `resolved_at` timestamp set
+6. On failure: status → `failed`, error stored in `action_error`
+
+### Lab 5 — Post-Incident
+
+**Location:** Post-mortem generation and ChromaDB episodic write
+
+On `resolved`, the system generates a post-mortem document that includes:
+
+- **Root cause** — synthesized from the agent's analysis
+- **Timeline** — reconstructed from `incident_events` timestamps
+- **MTTR** — delta between `detected` and `resolved` events
+- **Lessons learned** — recommendations based on incident type and tools used
+
+The document is stored in the `incidents-{domain}` ChromaDB collection via `store_incident()`, making it available as episodic memory for future similar incidents. The summary also appears in the Sentinel dashboard on the incident detail page.
+
+</Steps>
+
+## The Agent Registry Pattern
+
+Agents self-register at import time. Adding a new domain requires only creating a `DomainAgent` subclass and calling `register_agent()` — no changes to the supervisor or engine:
+
+```python
+# services/agents/my_new_domain/agent.py
+from services.agents.base import DomainAgent
+from services.agents.registry import register_agent
+
+class MyNewAgent(DomainAgent):
+    name = "my-domain"
+
+    def matches(self, ctx: IncidentContext) -> bool:
+        return ctx.labels.get("source_type") == "my-domain"
+
+    # ... implement tools(), system_prompt(), investigate()
+
+register_agent(MyNewAgent())
+```
+
+The registry exposes two functions used by the supervisor:
+
+| Function | Description |
+|---|---|
+| `find_agent_for(ctx)` | Returns the first agent whose `matches(ctx)` is `True`; `None` if none found |
+| `list_agents()` | Returns all registered agents (used in error messages) |
+
+## FastAPI Background Execution
+
+The entire pipeline runs as a FastAPI `BackgroundTask`. The HTTP response to the alert webhook returns immediately with `201 Created`, and triage runs asynchronously:
+
+```python
+# In the alerts router:
+background_tasks.add_task(
+    run_langgraph_engine,
+    incident_id=incident.id,
+    container_name=payload.target,
+    logs=payload.logs,
+    severity=payload.severity,
+    title=payload.title,
+    labels=payload.labels,
+)
+```
+
+This means the alert sender is never blocked waiting for classification or investigation to complete.
+
+<Note>
+Every stage of the pipeline creates a named span in LangFuse, linked to the `incident_id` as the session ID. The trace hierarchy is: `[severity] title` (root trace) → `Guardrail Input` → `Lab 1 — Alert Intake` → `classify-llm` (generation) → `Lab 2 — Investigation ({agent.name})` → `Guardrail Output` → `Lab 3 — Decision & Planning`. Each span records its inputs, outputs, and whether guardrails passed. Use the LangFuse dashboard at `LANGFUSE_HOST` to inspect any incident's full reasoning chain.
+</Note>

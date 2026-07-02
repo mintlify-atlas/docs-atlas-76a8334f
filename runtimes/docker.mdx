@@ -1,0 +1,206 @@
+---
+title: "Docker Runtime: Incident Triage with DockerAgent"
+sidebarTitle: "Docker"
+description: "How Sentinel's DockerAgent investigates Docker container incidents using docker_inspect, docker_logs, docker_stats, and docker_ps — with automatic restart proposals."
+---
+
+The **DockerAgent** is Sentinel's default runtime specialist for container incidents. It uses a bounded ReAct loop — up to four tool invocations — to gather live evidence from the Docker daemon, cross-reference the `runbooks-docker` ChromaDB collection, and recall similar past incidents before producing a structured markdown analysis. When the investigation concludes, the Supervisor proposes a safe, whitelisted action for human approval.
+
+## Runtime Detection
+
+The DockerAgent claims an alert when any of the following conditions is true (evaluated in order):
+
+1. The alert label `container_runtime=docker` is explicitly set.
+2. No other runtime label (`podman`, `kubernetes`, `containerd`) is present **and** `source_type` is not `database` **and** a non-empty `target` exists.
+
+In other words, Docker is the **fallback runtime** for all container alerts that do not match a more specific agent. Targets that start with `postgres/` or `mysql/` are always excluded.
+
+```python
+# services/agents/docker/agent.py — DockerAgent.matches()
+def matches(self, ctx: IncidentContext) -> bool:
+    source = (ctx.labels.get("source_type") or "").lower()
+    if source == "database":
+        return False
+
+    runtime = (ctx.labels.get("container_runtime") or "").lower()
+    if runtime == "docker":
+        return True
+    if runtime in {"podman", "kubernetes", "containerd"}:
+        return False
+
+    target = (ctx.target or "").lower()
+    if target.startswith("postgres/") or target.startswith("mysql/"):
+        return False
+
+    return bool(ctx.target)
+```
+
+## Prerequisites
+
+<Note>
+  The Docker socket **must** be mounted into the backend container at `/var/run/docker.sock`. The default `docker-compose.yml` already includes this bind mount:
+
+  ```yaml
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock:rw
+  ```
+
+  If the socket is not accessible, all four tools return a descriptive error message rather than raising an exception — the agent continues reasoning with the Loki logs already present in its context window.
+</Note>
+
+The backend connects via the `DOCKER_HOST` environment variable (default: `unix:///var/run/docker.sock`). You can override this to point at a remote Docker daemon over TCP if needed.
+
+## Tools
+
+All four tools are **read-only**. They never modify container state. The DockerAgent calls them only when the runbooks and Loki logs already in context are insufficient to produce a confident diagnosis.
+
+<CardGroup cols={2}>
+  <Card title="docker_inspect" icon="magnifying-glass">
+    Returns a JSON summary of a container's current state: `status`, `exit_code`, `restart_count`, memory/CPU limits, `oom_killed` flag, health check result, `restart_policy`, and timestamps.
+  </Card>
+  <Card title="docker_logs" icon="file-lines">
+    Fetches the last N log lines directly from the Docker daemon — more recent than what Loki may have indexed. Hard-capped at 200 lines.
+  </Card>
+  <Card title="docker_stats" icon="chart-bar">
+    Point-in-time resource snapshot: CPU percentage, memory usage vs. limit, memory percentage, and current PID count.
+  </Card>
+  <Card title="docker_ps" icon="list">
+    Lists all containers (running and stopped) with their name, short ID, status, and image. Useful for spotting related containers or recent crashes.
+  </Card>
+</CardGroup>
+
+### Tool Parameters
+
+| Tool | Parameter | Type | Default | Description |
+|------|-----------|------|---------|-------------|
+| `docker_inspect` | `container` | `string` | — | Container name or ID prefix |
+| `docker_logs` | `container` | `string` | — | Container name or ID prefix |
+| `docker_logs` | `tail` | `integer` | `50` | Number of lines to return (max 200) |
+| `docker_stats` | `container` | `string` | — | Container name or ID prefix |
+| `docker_ps` | *(none)* | — | — | Lists all containers |
+
+<Tip>
+  If the Docker socket is unavailable (e.g. the backend is running outside of Docker or without the bind mount), every tool returns a graceful fallback message such as:
+
+  ```
+  Tool 'docker_inspect' not available: the backend cannot access the Docker
+  daemon (socket not mounted). Reason with the Loki logs you already have.
+  ```
+
+  The agent then produces its analysis using only the Loki logs and runbook content already in its context.
+</Tip>
+
+## Action Proposals
+
+After investigation, the Supervisor's `_build_proposed_action` function selects a safe remediation command based on the classified `incident_type`. All proposals require explicit human approval in the dashboard before execution.
+
+<Tabs>
+  <Tab title="Restart proposal">
+    A `docker restart <container>` command is proposed for incident types that indicate the container process has stopped or is cycling:
+
+    | Incident type | Proposed action |
+    |---------------|-----------------|
+    | `app_crash` | `docker restart <container>` |
+    | `oom` | `docker restart <container>` |
+    | `restart_loop` | `docker restart <container>` |
+    | `dependency_failure` | `docker restart <container>` |
+    | `config_error` | `docker restart <container>` |
+  </Tab>
+  <Tab title="Logs proposal">
+    A `docker logs <container>` command is proposed for all other incident types where more log evidence is needed but a restart would be premature:
+
+    | Incident type | Proposed action |
+    |---------------|-----------------|
+    | `memory_pressure` | `docker logs <container>` |
+    | `cpu_throttling` | `docker logs <container>` |
+    | `network_error` | `docker logs <container>` |
+    | `disk_pressure` | `docker logs <container>` |
+    | `unknown` | `docker logs <container>` |
+  </Tab>
+</Tabs>
+
+The action executor in `routers/actions.py` validates the command against a strict allowlist — only `docker restart <name>` and `docker logs <name>` are permitted, with the container name checked against `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$`.
+
+## Simulating an Incident
+
+Use the following snippet to create a container that starts, prints log output, then exits with code 1 — triggering an `app_crash` classification.
+
+<Steps>
+  <Step title="Launch the crashing container">
+    ```bash
+    docker run -d --name demo-crash alpine sh -c "
+      echo '[INFO] Starting service on port 8080'
+      sleep 5
+      echo '[FATAL] Could not recover connection. Shutting down.'
+      exit 1
+    "
+    ```
+  </Step>
+  <Step title="Send the alert to Sentinel">
+    ```bash
+    curl -s -X POST http://localhost:8000/api/alerts \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $TOKEN" \
+      -d '{
+        "status": "firing",
+        "alerts": [{
+          "status": "firing",
+          "labels": {
+            "alertname": "ContainerExitedUnexpectedly",
+            "severity": "high",
+            "name": "demo-crash",
+            "container_runtime": "docker",
+            "source_type": "container"
+          },
+          "annotations": {
+            "summary": "demo-crash exited with code 1",
+            "description": "Container demo-crash terminated unexpectedly after startup."
+          },
+          "startsAt": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"
+        }]
+      }'
+    ```
+  </Step>
+  <Step title="Watch the agent investigate">
+    The DockerAgent will:
+    1. Call `docker_inspect demo-crash` to confirm `exit_code=1`, `status=exited`, and `restart_count`.
+    2. Call `docker_logs demo-crash` to retrieve the `[FATAL]` line.
+    3. Query the `runbooks-docker` ChromaDB collection for runbooks matching `app_crash`.
+    4. Check episodic memory for similar past incidents.
+    5. Produce a structured analysis and propose `docker restart demo-crash`.
+
+    The incident will appear in the dashboard at `http://localhost:5173` with status **Awaiting Approval**.
+  </Step>
+  <Step title="Approve and verify">
+    Approve the proposed `docker restart demo-crash` action in the dashboard. Sentinel executes it via subprocess, records the result, and moves the incident to **Verifying** before closing it as **Resolved** or **Failed**.
+  </Step>
+</Steps>
+
+## Investigation Flow
+
+```
+Alert received
+      │
+      ▼
+Supervisor classifies incident_type (gpt-4o-mini, JSON mode)
+      │
+      ▼
+DockerAgent.investigate(ctx)
+      ├── recall_runbooks("app_crash ...", k=3)   → runbooks-docker collection
+      ├── recall_similar_incidents("...", k=3)    → incidents-docker collection
+      │
+      ▼
+ReAct loop (max 4 iterations)
+      ├── docker_inspect <container>
+      ├── docker_logs <container>
+      └── (docker_stats / docker_ps if needed)
+      │
+      ▼
+Final analysis (markdown)
+      │
+      ▼
+Supervisor._build_proposed_action()  →  "docker restart demo-crash"
+      │
+      ▼
+Status: awaiting_approval  →  human approves  →  verifying  →  resolved
+```

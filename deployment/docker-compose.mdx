@@ -1,0 +1,186 @@
+---
+title: "Deploy Sentinel with Docker Compose"
+sidebarTitle: "Docker Compose"
+description: "Start the full Sentinel stack — backend, frontend, Prometheus, Alertmanager, Loki, ChromaDB, LangFuse, Grafana, and PostgreSQL demo — with a single docker compose up command."
+---
+
+The `docker-compose.yml` at the root of the repository defines the entire Sentinel infrastructure. A single command boots all fourteen services — the FastAPI backend, the React frontend, the observability pipeline (Prometheus, Alertmanager, Loki, Promtail, Grafana), the AI layer (ChromaDB, LangFuse), and a demo PostgreSQL instance with its exporter — wired together on a shared Docker network.
+
+## Start the stack
+
+```bash
+docker compose up -d
+```
+
+Pass `--build` on the first run or after pulling new code to rebuild the backend and frontend images:
+
+```bash
+docker compose up -d --build
+```
+
+## Services
+
+The following services are started by `docker compose up -d`:
+
+| Service | Container name | Description |
+|---|---|---|
+| `backend` | `sentinel-backend` | FastAPI + LangGraph agent engine |
+| `frontend` | `sentinel-frontend` | React + Vite dashboard |
+| `cadvisor` | `sentinel-cadvisor` | Docker container metrics collector |
+| `prometheus` | `sentinel-prometheus` | Metrics storage and alert evaluation |
+| `alertmanager` | `sentinel-alertmanager` | Routes Prometheus alerts to the backend webhook |
+| `loki` | `sentinel-loki` | Log aggregation storage |
+| `promtail` | `sentinel-promtail` | Log collector — ships Docker logs to Loki |
+| `langfuse` | `sentinel-langfuse` | Self-hosted LangFuse v2 agent observability UI |
+| `langfuse-db` | `sentinel-langfuse-db` | PostgreSQL 15 backing store for LangFuse |
+| `postgres-demo` | `sentinel-postgres-demo` | Demo PostgreSQL instance for incident simulation |
+| `postgres-exporter` | `sentinel-postgres-exporter` | Exports demo PostgreSQL metrics to Prometheus |
+| `podman-exporter` | `sentinel-podman-exporter` | Exports Podman container metrics to Prometheus |
+| `chromadb` | `sentinel-chromadb` | Vector database for runbook RAG and episodic memory |
+| `grafana` | `sentinel-grafana` | Metrics and logs dashboards |
+
+## Port mappings
+
+Every service binds to `localhost` only. The table below lists the host port each service is reachable on:
+
+| Service | Host port | Container port | URL |
+|---|---|---|---|
+| `backend` | `8000` | `8000` | http://localhost:8000 |
+| `frontend` | `5173` | `5173` | http://localhost:5173 |
+| `cadvisor` | `8080` | `8080` | http://localhost:8080 |
+| `prometheus` | `9090` | `9090` | http://localhost:9090 |
+| `alertmanager` | `9093` | `9093` | http://localhost:9093 |
+| `loki` | `3100` | `3100` | http://localhost:3100 |
+| `langfuse` | `3001` | `3000` | http://localhost:3001 |
+| `postgres-demo` | `5433` | `5432` | `postgresql://sentinel:sentinel123@localhost:5433/sentinel_demo` |
+| `postgres-exporter` | `9187` | `9187` | http://localhost:9187 |
+| `podman-exporter` | `9882` | `9882` | http://localhost:9882 |
+| `chromadb` | `8001` | `8000` | http://localhost:8001 |
+| `grafana` | `3000` | `3000` | http://localhost:3000 |
+
+<Note>
+`langfuse-db` and `promtail` do not expose ports to the host — they are only accessible within the Docker network by their service names.
+</Note>
+
+## Volumes
+
+Docker Compose creates named volumes to persist data between restarts:
+
+| Volume | Service | What it persists |
+|---|---|---|
+| `prometheus_data` | `prometheus` | Prometheus TSDB (time-series metrics) |
+| `loki_data` | `loki` | Loki log chunks and indexes |
+| `grafana_data` | `grafana` | Grafana dashboards, data sources, and settings |
+| `langfuse_data` | `langfuse-db` | LangFuse PostgreSQL database |
+| `chroma_data` | `chromadb` | ChromaDB vector collections (runbooks + episodic memory) |
+| `backend_env` | `backend` | Python virtualenv — isolates it from the host to prevent WatchFiles storms |
+| `chroma_cache` | `backend` | ONNX embedding model (~79 MB) — avoids re-downloading on every restart |
+| `postgres_demo_data` | `postgres-demo` | Demo PostgreSQL data directory |
+
+The `backend` service also bind-mounts `./Backend:/app` (source hot-reload) and `${HOME}/.kube:/root/.kube:ro` (Kubernetes config).
+
+## Special considerations
+
+### Docker socket (cAdvisor and backend)
+
+Both `cadvisor` and `backend` mount the Docker socket:
+
+```yaml
+volumes:
+  - /var/run/docker.sock:/var/run/docker.sock:rw
+```
+
+This allows cAdvisor to collect per-container CPU and memory metrics, and allows the backend's `DockerAgent` to inspect, restart, and interact with containers programmatically.
+
+<Warning>
+Mounting the Docker socket grants the container root-equivalent access to the Docker daemon. This is intentional for a local dev/demo environment but should be reviewed before deploying to a shared or production host.
+</Warning>
+
+### Podman socket (Linux only)
+
+The backend mounts the Podman rootless socket to enable the `PodmanAgent`:
+
+```yaml
+volumes:
+  - /run/user/1000/podman/podman.sock:/run/podman/podman.sock:rw
+```
+
+The `podman-exporter` service also requires this socket for Prometheus metrics.
+
+<Warning>
+The Podman socket at `/run/user/1000/podman/podman.sock` is only available on Linux hosts with Podman installed and the rootless socket activated (`systemctl --user enable --now podman.socket`). On macOS with Docker Desktop this path does not exist — Docker Compose will silently skip the bind mount and the Podman-specific features will be unavailable.
+
+If your Linux user has a UID other than `1000`, update the volume path in `docker-compose.yml` and the `PODMAN_HOST` environment variable accordingly.
+</Warning>
+
+### Kubernetes kubeconfig
+
+The backend mounts your local `~/.kube` directory read-only so the `KubernetesAgent` can reach the cluster configured in your kubeconfig:
+
+```yaml
+volumes:
+  - ${HOME}/.kube:/root/.kube:ro
+```
+
+The backend reads the config from `/root/.kube/config` inside the container (controlled by `KUBECONFIG=/root/.kube/config`).
+
+### Docker Desktop and the Kubernetes API server
+
+When running Kubernetes through Docker Desktop, the API server listens on `127.0.0.1:6443` on the host — an address that is not reachable from inside Docker containers. To expose it to the backend, run a `kubectl proxy` on your LAN IP before starting the demo:
+
+```bash
+# Replace 192.168.x.x with your machine's LAN IP (ifconfig | grep "inet 192")
+kubectl proxy --port=8555 --address=192.168.x.x --accept-hosts='.*' &
+```
+
+Then set `K8S_PROXY_URL` in `docker-compose.yml` (or `Backend/.env`) to the proxy URL:
+
+```bash
+K8S_PROXY_URL=http://192.168.x.x:8555
+```
+
+Leave `K8S_PROXY_URL` empty if your Kubernetes cluster is reachable directly from inside containers (e.g., a remote cluster or a Linux host running `kind`/`minikube`).
+
+## Useful commands
+
+<Steps>
+  <Step title="Stop the stack">
+    Stops all containers without removing volumes or images:
+
+    ```bash
+    docker compose down
+    ```
+
+    To also remove named volumes (resets all persisted state):
+
+    ```bash
+    docker compose down -v
+    ```
+  </Step>
+
+  <Step title="View logs">
+    Stream logs from a single service:
+
+    ```bash
+    docker compose logs -f backend
+    ```
+
+    Stream logs from all services at once:
+
+    ```bash
+    docker compose logs -f
+    ```
+  </Step>
+
+  <Step title="Restart a single service">
+    ```bash
+    docker compose restart backend
+    ```
+  </Step>
+
+  <Step title="Rebuild after code changes">
+    ```bash
+    docker compose up -d --build backend frontend
+    ```
+  </Step>
+</Steps>

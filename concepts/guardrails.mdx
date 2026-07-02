@@ -1,0 +1,249 @@
+---
+title: "Guardrails: Safety and Security for the Sentinel Agent"
+sidebarTitle: "Guardrails"
+description: "How Sentinel's multi-layer guardrail system blocks prompt injection, enforces action whitelists, validates incident classifications, and scopes agent responses to DevOps topics."
+---
+
+Sentinel operates with significant autonomy — it classifies incidents, executes tool calls, and proposes remediation commands. That autonomy requires strict boundaries. The guardrail system is the enforcement layer: a set of deterministic checks and a semantic LLM judge that together ensure the pipeline can never be manipulated into harmful behavior, no matter what appears in the logs it analyzes.
+
+There are four guardrails, each positioned at a specific point in the pipeline, plus a two-node LangGraph subgraph that orchestrates the combination of rule-based and semantic checks.
+
+## Why Deterministic Rules (Not Just LLMs)
+
+The four core guardrails in `guardrails.py` do not call OpenAI. They use compiled regex and simple logic. This design choice is deliberate:
+
+- **Fast** — no network round-trip, microsecond execution
+- **Free** — does not count toward the LLM rate limit budget
+- **Auditable** — the exact patterns are in the source code, testable with plain unit tests
+- **Deterministic** — same input always produces the same result
+
+The LLM judge (`llm_guardrail.py`) is a second layer for semantic edge cases that regex cannot catch — it runs after the rule layer, not instead of it.
+
+---
+
+## Guardrail 1 — Input Check
+
+**Function:** `guardrails.check_input(title, logs)` → `GuardrailResult`  
+**When:** Before any LLM sees the incident (first node in the pipeline)
+
+This guardrail protects the pipeline from prompt injection attacks hidden in log content. An attacker who can write to application logs could try to override the agent's instructions by embedding text like `ignore all previous instructions` in a stack trace.
+
+**What it does:**
+
+1. **Truncates logs** to `_MAX_LOG_CHARS = 4000` characters. Logs beyond this limit are dropped — they add noise and expand the injection surface.
+2. **Scans** the combined title + truncated logs for 8 prompt injection patterns:
+
+```python
+re.compile(r"ignore (all |the |your |previous )+(instructions|prompt|rules)", re.I)
+re.compile(r"olvida (todas )?(las )?instrucciones (previas|anteriores)", re.I)
+re.compile(r"you are now (a|an) ", re.I)
+re.compile(r"ahora eres (un|una) ", re.I)
+re.compile(r"system prompt", re.I)
+re.compile(r"reveal your (instructions|prompt|system)", re.I)
+re.compile(r"act as (a|an) ", re.I)
+re.compile(r"disregard (the |all |your )", re.I)
+```
+
+3. **Neutralizes** — does not abort. Each individual log line is checked against the same patterns; matching lines are replaced with `[LÍNEA NEUTRALIZADA POR GUARDRAIL — posible inyección]`. The sanitized logs are passed downstream so the incident can still be triaged, but the injected instructions are inert.
+
+**Return value:**
+
+```python
+@dataclass
+class GuardrailResult:
+    passed:     bool          # False if any violation found
+    sanitized:  str           # cleaned logs (always returned, even if passed=False)
+    violations: list[str]     # human-readable descriptions of what was detected
+```
+
+---
+
+## Guardrail 2 — Classification Check
+
+**Function:** `guardrails.check_incident_type(incident_type)` → `GuardrailResult`  
+**When:** Immediately after `_classify()` returns (end of Lab 1)
+
+The classification LLM is instructed to return one of ten valid incident types. However, LLMs can hallucinate — they may return a plausible-sounding but unsupported value like `"database_corruption"` or `"timeout_error"`. This guardrail is the enforcement point.
+
+**Allowed set:**
+
+```python
+_VALID_INCIDENT_TYPES = {
+    "app_crash", "oom", "config_error", "dependency_failure",
+    "memory_pressure", "cpu_throttling", "restart_loop",
+    "network_error", "disk_pressure", "unknown",
+}
+```
+
+If the LLM returns any value not in this set, the guardrail:
+- Sets `passed = False`
+- Forces `sanitized = "unknown"` 
+- Logs a warning: `[guardrails.classification] Tipo inválido '{incident_type}' → 'unknown'`
+
+The `unknown` fallback is a valid operational type — the investigation continues, and the specialist agent still inspects the target and produces an analysis. Nothing breaks; the frontend is protected from an unrecognized category string.
+
+---
+
+## Guardrail 3 — Action Check
+
+**Function:** `guardrails.check_proposed_action(action)` → `GuardrailResult`  
+**When:** After `_build_proposed_action()` returns (end of Lab 3), before `proposed_action` is written to Supabase
+
+This is the most critical guardrail. It gates every command that will be shown to an engineer for approval — and eventually executed on production infrastructure. Two checks run in sequence:
+
+**Step 1 — Metacharacter block:**  
+Any action containing `;`, `&&`, `||`, `|`, `` ` ``, `$(`, `>`, or `<` is immediately rejected. These characters enable shell injection chaining and have no place in a safe whitelisted command.
+
+**Step 2 — Whitelist match:**  
+The action must fully match one of six compiled regex patterns:
+
+<Warning>
+The following six patterns are the **complete and exhaustive** list of commands Sentinel can propose. Any action that does not match exactly one of these patterns is blocked — regardless of how it was generated.
+</Warning>
+
+```python
+# Docker
+re.compile(r"^docker (restart|logs) [a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
+
+# Podman
+re.compile(r"^podman (restart|logs) [a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
+
+# PostgreSQL
+re.compile(r"^pg_(stat_activity|cancel_backend|terminate_backend) "
+           r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$")
+
+# Kubernetes — restart deployment
+re.compile(
+    r"^kubectl rollout restart deployment/[a-zA-Z0-9][a-zA-Z0-9-]{0,62}"
+    r"( -n [a-zA-Z0-9][a-zA-Z0-9-]{0,62})?$"
+)
+
+# Kubernetes — delete pod
+re.compile(
+    r"^kubectl delete pod [a-zA-Z0-9][a-zA-Z0-9-]{0,62}"
+    r"( -n [a-zA-Z0-9][a-zA-Z0-9-]{0,62})?$"
+)
+
+# Kubernetes — scale deployment (replicas 0–10)
+re.compile(
+    r"^kubectl scale deployment/[a-zA-Z0-9][a-zA-Z0-9-]{0,62}"
+    r" --replicas=(10|[0-9])"
+    r"( -n [a-zA-Z0-9][a-zA-Z0-9-]{0,62})?$"
+)
+```
+
+In human-readable form, the allowed commands are:
+
+```
+docker (restart|logs) <container-name>
+podman (restart|logs) <container-name>
+pg_(stat_activity|cancel_backend|terminate_backend) <datname>
+kubectl rollout restart deployment/<name> [-n <namespace>]
+kubectl delete pod <pod-name> [-n <namespace>]
+kubectl scale deployment/<name> --replicas=<0-10> [-n <namespace>]
+```
+
+**`action=None` is valid.** When `_build_proposed_action` determines that no safe action can be inferred (ambiguous target, unsupported runtime, unusual incident type combination), it returns `None`. `check_proposed_action(None)` returns `passed=True` with `sanitized=""` — no action is proposed, and the incident stays at `analyzed`.
+
+This guardrail is defense-in-depth: `_build_proposed_action` already generates only whitelisted commands, but this re-validation is an independent check. If that function were ever modified, or a future agent tried to propose a custom command, this guardrail would intercept it before it reached any human or any database row.
+
+---
+
+## Guardrail 4 — Output Scope Check
+
+**Function:** `guardrails.check_analysis_output(analysis)` → `GuardrailResult`  
+**When:** After the specialist agent returns `InvestigationResult.analysis` (end of Lab 2)
+
+This guardrail ensures the agent's analysis stayed within the DevOps domain. If a prompt injection in the logs succeeded in partially diverting the agent, the output guardrail is the last line of defense before the analysis is shown to engineers.
+
+**Checks performed:**
+
+1. **Length check** — analysis shorter than 20 characters is flagged as empty or incomplete
+2. **Off-topic pattern detection:**
+
+```python
+# Cooking, jokes, poems, songs
+re.compile(r"\b(receta\s+de\s+cocina|chiste|poema|canción|cancion)\b", re.I)
+
+# Political, religious content
+# Note: "política" alone is NOT checked — it collides with valid DevOps terms like
+# "política de reinicio", "política de restart", "política de recursos"
+re.compile(r"\b(religión|religion|partido\s+político|elecciones presidenciales)\b", re.I)
+
+# Financial / crypto
+re.compile(r"\b(bitcoin|criptomoneda|invertir en bolsa|acciones de bolsa)\b", re.I)
+```
+
+Unlike the input guardrail, the output guardrail **does not rewrite** the analysis (that would require another LLM call and risk distorting real diagnostic content). Instead, it prepends a visible warning banner:
+
+```markdown
+> ⚠️ **Aviso del guardrail:** la respuesta del agente fue marcada por 
+posible desviación del tema o contenido incompleto. Revísala con criterio.
+```
+
+Engineers see the full original analysis alongside the warning, so they can make their own judgment. The incident is not blocked — human review is always the final gate.
+
+---
+
+## The LangGraph Guardrail Graph
+
+The deterministic guardrails are composed with the LLM judge into a two-node LangGraph graph defined in `guardrail_graph.py`. This graph runs for both input and output checks:
+
+```
+START
+  │
+  ▼
+rules_node         ← guardrails.check_input() or check_analysis_output()
+  │
+  ├── (empty text) ──────────────────────────────────► END
+  │
+  └── (has text) ──► llm_judge_node ──────────────────► END
+                      llm_guardrail.judge()
+```
+
+**State object flowing through the graph:**
+
+```python
+class GuardrailState(TypedDict, total=False):
+    text:         str          # original text to evaluate
+    stage:        str          # "input" | "output"
+    rules_passed: bool         # result from rules_node
+    llm_passed:   bool         # result from llm_judge_node
+    sanitized:    str          # processed text
+    violations:   list[str]    # all accumulated violation reasons
+```
+
+The graph is compiled once at module import time (`_GRAPH = _build_graph()`) and reused for all invocations. The supervisor calls:
+
+- `guardrail_graph.run_input_guardrail(title, logs)` — returns `GuardrailState`; `sanitized` contains clean logs
+- `guardrail_graph.run_output_guardrail(analysis)` — returns `GuardrailState`; `sanitized` contains analysis (with banner if flagged)
+
+---
+
+## The LLM Judge
+
+**Module:** `llm_guardrail.py`  
+**Function:** `judge(text, stage) → dict`
+
+The LLM judge is a dedicated `gpt-4o-mini` call with a fixed system prompt. It evaluates two dimensions independently:
+
+```python
+# System prompt instructs the model to respond ONLY with:
+{"safe": true|false, "on_topic": true|false, "reason": "<max 1 sentence>"}
+```
+
+- **`safe=false`** — text is attempting to manipulate the agent, change its instructions, or execute unauthorized actions
+- **`on_topic=false`** — content is outside the DevOps/SRE domain (containers, databases, logs, metrics, incidents)
+
+The judge receives up to 3,000 characters of text. If the LLM is unavailable, it defaults to `safe=true, on_topic=true` (fail-open). If `llm_passed` is `False` on an input check, the sanitized text is completely replaced with `[CONTENIDO BLOQUEADO POR GUARDRAIL SEMÁNTICO]`. For output checks, it appends a secondary warning banner if one was not already added by the rules node.
+
+---
+
+## Guardrail Positions Summary
+
+| Guardrail | Position in Pipeline | Method | Blocks or Warns? |
+|---|---|---|---|
+| Input check | Before Lab 1 (classification) | `check_input` + LLM judge | Neutralizes lines; blocks if LLM flags |
+| Classification check | After Lab 1 | `check_incident_type` | Forces to `unknown` (never hard-blocks) |
+| Action check | After Lab 3 | `check_proposed_action` | Hard-blocks: clears `proposed_action` |
+| Output scope check | After Lab 2 | `check_analysis_output` + LLM judge | Prepends warning banner; never blocks |

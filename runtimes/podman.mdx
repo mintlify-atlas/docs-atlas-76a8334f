@@ -1,0 +1,222 @@
+---
+title: "Podman Runtime: Rootless Container Incident Triage"
+sidebarTitle: "Podman"
+description: "Configure Sentinel to monitor and triage Podman rootless containers using the Docker-compatible SDK via the Podman socket, without requiring the podman binary."
+---
+
+The **PodmanAgent** handles alerts from Podman rootless containers. It uses the same Docker-compatible REST API that Podman exposes via its socket, which means no `podman` binary is required inside the backend container — only the Docker Python SDK pointed at the right socket path. The four read-only tools (`podman_inspect`, `podman_logs`, `podman_stats`, `podman_ps`) mirror the Docker tool interface but are wired to the Podman socket.
+
+## Runtime Detection
+
+The PodmanAgent activates exclusively when the alert label `container_runtime=podman` is set. It never acts as a fallback runtime and explicitly skips any alert with `source_type=database`.
+
+```python
+# services/agents/podman/agent.py — PodmanAgent.matches()
+def matches(self, ctx: IncidentContext) -> bool:
+    source = (ctx.labels.get("source_type") or "").lower()
+    if source == "database":
+        return False
+    runtime = (ctx.labels.get("container_runtime") or "").lower()
+    return runtime == "podman"
+```
+
+Your Alertmanager or synthetic alert payload must include `"container_runtime": "podman"` in the labels for this agent to be selected.
+
+## How the SDK Connection Works
+
+Podman implements a Docker-compatible REST API. The PodmanAgent uses the standard `docker` Python SDK pointed at the Podman socket via `PODMAN_HOST`. No Podman CLI is involved anywhere in the triage path.
+
+```
+Backend container
+       │
+       │  docker.DockerClient(base_url=PODMAN_HOST)
+       │
+       ▼
+/run/podman/podman.sock  ──bind-mounted──▶  /run/user/1000/podman/podman.sock
+       │
+       ▼
+Podman REST API (Docker-compatible)
+```
+
+### Socket Discovery Order
+
+If `PODMAN_HOST` is not set, the tools probe the following paths in order until one responds successfully:
+
+| Priority | Socket path | Use case |
+|----------|-------------|----------|
+| 1 | `$PODMAN_HOST` (if set) | Explicit override |
+| 2 | `unix:///run/user/1000/podman/podman.sock` | Linux rootless, UID 1000 |
+| 3 | `unix:///run/user/501/podman/podman.sock` | macOS Podman machine (UID 501) |
+| 4 | `unix:///tmp/podman.sock` | Custom / CI environments |
+
+## Prerequisites
+
+<Warning>
+  The Podman rootless socket is a **Linux-only** feature. macOS does not expose a native Podman socket accessible from Docker Desktop containers. On macOS, Podman runs inside a VM (`podman machine`) and the socket path inside the VM (`/run/user/501/podman/podman.sock`) is not reachable from Sentinel's backend container without additional tunneling.
+</Warning>
+
+### Enable the Podman socket (Linux)
+
+<Steps>
+  <Step title="Enable the systemd socket unit for your user">
+    ```bash
+    systemctl --user enable --now podman.socket
+    ```
+
+    This creates the socket at `/run/user/$(id -u)/podman/podman.sock`. For UID 1000 the path is `/run/user/1000/podman/podman.sock`.
+  </Step>
+  <Step title="Verify the socket is active">
+    ```bash
+    systemctl --user status podman.socket
+    curl --unix-socket /run/user/1000/podman/podman.sock http://localhost/version
+    ```
+  </Step>
+  <Step title="Confirm the bind mount in docker-compose.yml">
+    The default compose file mounts the socket into both the backend and the `podman-exporter` services:
+
+    ```yaml
+    # docker-compose.yml (backend service)
+    volumes:
+      - /run/user/1000/podman/podman.sock:/run/podman/podman.sock:rw
+
+    environment:
+      PODMAN_HOST: "unix:///run/podman/podman.sock"
+    ```
+
+    The backend always reads `/run/podman/podman.sock` regardless of the host UID.
+  </Step>
+</Steps>
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PODMAN_HOST` | `unix:///run/podman/podman.sock` | Socket URL used by the Docker SDK to reach Podman |
+
+## Tools
+
+All four tools are **read-only** and share the same interface design as the Docker tools. They communicate exclusively with the Podman REST API — no shell commands are executed.
+
+<CardGroup cols={2}>
+  <Card title="podman_inspect" icon="magnifying-glass">
+    Returns container state, `exit_code`, `oom_killed`, `restart_count`, memory limit (MB), CPU quota, image, and stop/start timestamps. Use this to confirm whether the container is truly down and what its resource limits were.
+  </Card>
+  <Card title="podman_logs" icon="file-lines">
+    Fetches the last N lines (default 80) from a Podman container — including stopped containers. Returns both `stdout` and `stderr` with timestamps.
+  </Card>
+  <Card title="podman_stats" icon="chart-bar">
+    Point-in-time CPU percentage, memory used (MB), memory limit (MB), and memory percentage. Only available for running containers — returns a descriptive message for stopped ones.
+  </Card>
+  <Card title="podman_ps" icon="list">
+    Lists all Podman containers (running and stopped) with name, short ID, status, and image tag. Use this to survey the host and find containers in error or restart loops.
+  </Card>
+</CardGroup>
+
+### Tool Parameters
+
+| Tool | Parameter | Type | Default | Description |
+|------|-----------|------|---------|-------------|
+| `podman_inspect` | `container_name` | `string` | — | Container name or ID |
+| `podman_logs` | `container_name` | `string` | — | Container name or ID |
+| `podman_logs` | `tail` | `integer` | `80` | Number of lines to return |
+| `podman_stats` | `container_name` | `string` | — | Container name or ID |
+| `podman_ps` | *(none)* | — | — | Lists all containers |
+
+## Podman-Specific Failure Modes
+
+The PodmanAgent's system prompt instructs it to reason about Podman-specific behaviors that differ from Docker:
+
+- **Rootless permission errors** — containers run without root privileges; bind mounts and port bindings below 1024 require explicit configuration.
+- **No central daemon** — each container is a direct child process of the user session. If the parent session (e.g. SSH) dies, containers may be affected depending on the `--keep-alive` configuration.
+- **Pod infra container failures** — a crash in the Podman pod's infra container (`pause`) can terminate all containers in that pod simultaneously.
+- **Socket location** — sockets live in `/run/user/<uid>/podman/` not `/var/run/docker.sock`, which affects how monitoring tools connect.
+
+## Action Proposals
+
+The Supervisor generates a `podman restart <container>` or `podman logs <container>` proposal using the same incident-type logic as the Docker runtime. Action execution uses the Docker SDK (not the `podman` binary) via `_run_podman_command`.
+
+<Tabs>
+  <Tab title="Restart proposal">
+    | Incident type | Proposed action |
+    |---------------|-----------------|
+    | `app_crash` | `podman restart <container>` |
+    | `oom` | `podman restart <container>` |
+    | `restart_loop` | `podman restart <container>` |
+    | `dependency_failure` | `podman restart <container>` |
+    | `config_error` | `podman restart <container>` |
+  </Tab>
+  <Tab title="Logs proposal">
+    | Incident type | Proposed action |
+    |---------------|-----------------|
+    | `memory_pressure` | `podman logs <container>` |
+    | `cpu_throttling` | `podman logs <container>` |
+    | `network_error` | `podman logs <container>` |
+    | `disk_pressure` | `podman logs <container>` |
+    | `unknown` | `podman logs <container>` |
+  </Tab>
+</Tabs>
+
+The action executor validates commands against the allowlist `{"restart", "logs"}` and verifies the container name with `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$`.
+
+## Prometheus Metrics via podman-exporter
+
+The `docker-compose.yml` includes a dedicated `podman-exporter` service that exposes Podman container metrics in the Prometheus format, scraped by the stack's Prometheus instance:
+
+```yaml
+podman-exporter:
+  image: quay.io/navidys/prometheus-podman-exporter:latest
+  container_name: sentinel-podman-exporter
+  environment:
+    CONTAINER_HOST: "unix:///run/podman/podman.sock"
+  volumes:
+    - /run/user/1000/podman/podman.sock:/run/podman/podman.sock:ro
+```
+
+This enables Alertmanager rules such as `PodmanContainerCrashed` to fire based on real metric signals rather than only synthetic test alerts.
+
+## Simulating an Incident
+
+The `demo_podman.sh.example` script in the repository root walks through the full simulation cycle. Here is a condensed version of the key steps:
+
+<Steps>
+  <Step title="Start the demo container">
+    ```bash
+    podman run -d --name test-app docker.io/library/nginx:alpine
+    ```
+  </Step>
+  <Step title="Simulate a crash by stopping the container">
+    ```bash
+    podman stop test-app
+    # Verify it shows as "exited"
+    podman ps -a --filter "name=^test-app$" --format "{{.Names}}  {{.Status}}"
+    ```
+  </Step>
+  <Step title="Send the alert payload">
+    ```bash
+    curl -s -X POST http://localhost:8000/api/alerts \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $TOKEN" \
+      -d '{
+        "status": "firing",
+        "alerts": [{
+          "status": "firing",
+          "labels": {
+            "alertname": "PodmanContainerCrashed",
+            "severity": "high",
+            "name": "test-app",
+            "container_runtime": "podman",
+            "source_type": "container"
+          },
+          "annotations": {
+            "summary": "Podman container test-app is down",
+            "description": "The container test-app terminated unexpectedly."
+          },
+          "startsAt": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"
+        }]
+      }'
+    ```
+  </Step>
+  <Step title="Approve the restart in the dashboard">
+    The PodmanAgent calls `podman_inspect test-app` and `podman_logs test-app`, produces its analysis, and proposes `podman restart test-app`. Open the Sentinel dashboard at `http://localhost:5173`, review the analysis, and approve. The backend restarts the container via the Docker SDK pointed at the Podman socket.
+  </Step>
+</Steps>

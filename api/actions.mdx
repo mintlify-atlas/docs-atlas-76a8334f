@@ -1,0 +1,246 @@
+---
+title: "Actions API: Execute, Reject, and Postpone Incident Remediation"
+sidebarTitle: "Actions"
+description: "Reference for the three action endpoints in Sentinel: POST /api/execute-action to run a whitelisted command, and POST /api/incidents/{id}/reject and /postpone for human decisions."
+---
+
+The Actions API gives human operators control over the remediation actions proposed by Sentinel's LangGraph agent. Once an incident reaches `awaiting_approval` status, an engineer can approve the action (executing it atomically), reject it (marking the incident `failed`), or postpone it (sending it back to `analyzed` for later review). All three endpoints require a Supabase JWT, and the caller's identity is recorded in the `approved_by` field for audit purposes.
+
+## Allowed Commands
+
+Sentinel enforces a strict command whitelist at execution time. The backend re-validates the command regardless of what is stored in `proposed_action`. The following command forms are accepted:
+
+| Runtime | Allowed commands |
+|---|---|
+| Docker | `docker restart <container>`, `docker logs <container>` |
+| Podman | `podman restart <container>`, `podman logs <container>` |
+| Kubernetes | `kubectl rollout restart deployment/<name> [-n <ns>]` |
+| Kubernetes | `kubectl delete pod <pod-name> [-n <ns>]` |
+| Kubernetes | `kubectl scale deployment/<name> --replicas=<0-10> [-n <ns>]` |
+| PostgreSQL | `pg_stat_activity <datname>` |
+| PostgreSQL | `pg_cancel_backend <datname>` |
+| PostgreSQL | `pg_terminate_backend <datname>` |
+
+Shell metacharacters (`;`, `&&`, `|`, `` ` ``, `$(`, `>`, `<`) are rejected in all kubectl commands.
+
+---
+
+## POST /api/execute-action
+
+Execute the proposed remediation action for an incident. The endpoint enforces atomic single-execution to prevent duplicate runs.
+
+**Auth required:** Yes
+
+<ParamField body="incident_id" type="string" required>
+  UUID of the incident to act on.
+</ParamField>
+
+<ParamField body="command" type="string" required>
+  The exact command to execute. Must match the incident's `proposed_action` field character-for-character. Maximum 200 characters.
+</ParamField>
+
+<Warning>
+  The `command` field must exactly match the `proposed_action` stored on the incident — no extra spaces, flags, or modifications. The backend validates the command against the whitelist independently, so even a copied `proposed_action` that somehow bypassed earlier checks will be rejected here.
+</Warning>
+
+### Execution Flow
+
+<Steps>
+  <Step title="Verify incident status">
+    Checks that the incident is in `awaiting_approval`. Returns `409 Conflict` if not.
+  </Step>
+  <Step title="Verify command match">
+    Compares `command` against the stored `proposed_action`. Returns `400 Bad Request` if they differ.
+  </Step>
+  <Step title="Atomic DB claim">
+    Performs a conditional `UPDATE SET status = 'executing_solution'` that only succeeds if the incident is still in `awaiting_approval`. Returns `409 Conflict` if another process claimed it first. Records `approved_by` from the JWT.
+  </Step>
+  <Step title="Route and execute">
+    Routes to the correct execution branch based on `source_type` and `container_runtime`:
+    - **PostgreSQL** → psycopg2 direct connection
+    - **Kubernetes** → kubectl subprocess (with optional `K8S_PROXY_URL`)
+    - **Podman** → Docker SDK against the rootless Podman socket (`PODMAN_HOST`)
+    - **Docker** → subprocess
+  </Step>
+  <Step title="Update and verify">
+    On success: sets status to `verifying` and launches an async verification background task. On failure: sets status to `failed` immediately.
+  </Step>
+</Steps>
+
+### Response
+
+<ResponseField name="incident_id" type="string">
+  UUID of the incident that was acted on.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Resulting incident status: `verifying` on success, `failed` on execution error.
+</ResponseField>
+
+<ResponseField name="exit_code" type="integer">
+  Process exit code. `0` on success. Common failure codes: `124` (timeout), `127` (binary not found).
+</ResponseField>
+
+<ResponseField name="stdout" type="string">
+  Standard output from the command. For PostgreSQL commands, this is a JSON string containing query results.
+</ResponseField>
+
+<ResponseField name="stderr" type="string">
+  Standard error output or error description.
+</ResponseField>
+
+<ResponseField name="friendly_message" type="string">
+  Human-readable error summary, present only when `status` is `failed`. Suitable for display in the UI.
+</ResponseField>
+
+<Tabs>
+  <Tab title="Request">
+    ```bash
+    curl -X POST \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "incident_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "command": "docker restart my-service"
+      }' \
+      https://sentinel-softserve.onrender.com/api/execute-action
+    ```
+  </Tab>
+  <Tab title="Response (success)">
+    ```json
+    {
+      "incident_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "status": "verifying",
+      "exit_code": 0,
+      "stdout": "my-service",
+      "stderr": ""
+    }
+    ```
+  </Tab>
+  <Tab title="Response (failure)">
+    ```json
+    {
+      "incident_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "status": "failed",
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "Error response from daemon: No such container: my-service",
+      "friendly_message": "La ejecución automática falló. Se recomienda revisión manual."
+    }
+    ```
+  </Tab>
+  <Tab title="Response (409 – already executed)">
+    ```json
+    {
+      "detail": "La accion ya fue ejecutada o el incidente cambio de estado"
+    }
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## POST /api/incidents/{incident_id}/reject
+
+Reject the proposed action, permanently closing the incident as `failed`. Use this when the proposed action is unsafe, incorrect, or no longer relevant.
+
+**Auth required:** Yes
+
+<ParamField path="incident_id" type="string" required>
+  UUID of the incident.
+</ParamField>
+
+<ParamField body="comment" type="string">
+  Optional reason for rejection. Maximum 500 characters. If omitted, defaults to `"Acción rechazada por el ingeniero."` The comment is prefixed with `[RECHAZADO]` and stored in `action_error`.
+</ParamField>
+
+This endpoint is atomic: the `UPDATE` only proceeds if the incident is still in `awaiting_approval`. If it has already moved to another status, `409 Conflict` is returned. The caller's identity is recorded in `approved_by`.
+
+<Tabs>
+  <Tab title="Request">
+    ```bash
+    curl -X POST \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{"comment": "Restart would cause data loss during active transaction"}' \
+      https://sentinel-softserve.onrender.com/api/incidents/a1b2c3d4-.../reject
+    ```
+  </Tab>
+  <Tab title="Response">
+    ```json
+    {
+      "incident_id": "a1b2c3d4-...",
+      "status": "failed",
+      "note": "Restart would cause data loss during active transaction"
+    }
+    ```
+  </Tab>
+  <Tab title="Response (409)">
+    ```json
+    {
+      "detail": "El incidente no está en estado 'Esperando aprobación'"
+    }
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## POST /api/incidents/{incident_id}/postpone
+
+Postpone the proposed action, returning the incident to `analyzed` status for later review. The proposed action and agent reasoning are preserved; the incident can be approved, rejected, or re-analyzed later.
+
+**Auth required:** Yes
+
+<ParamField path="incident_id" type="string" required>
+  UUID of the incident.
+</ParamField>
+
+<ParamField body="comment" type="string">
+  Optional reason for postponement. Maximum 500 characters. If omitted, defaults to `"Acción pospuesta por el ingeniero."` The comment is prefixed with `[POSPUESTO]` and stored in `action_error`.
+</ParamField>
+
+This endpoint is atomic: the `UPDATE` only proceeds if the incident is still in `awaiting_approval`. Returns `409 Conflict` if it has already moved. The caller's identity is recorded in `approved_by`.
+
+<Note>
+  Unlike reject, postpone sets the status back to `analyzed` rather than `failed`, leaving the door open for a future approval or re-triage.
+</Note>
+
+<Tabs>
+  <Tab title="Request">
+    ```bash
+    curl -X POST \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{"comment": "Maintenance window scheduled for 02:00 UTC — will action then"}' \
+      https://sentinel-softserve.onrender.com/api/incidents/a1b2c3d4-.../postpone
+    ```
+  </Tab>
+  <Tab title="Response">
+    ```json
+    {
+      "incident_id": "a1b2c3d4-...",
+      "status": "analyzed",
+      "note": "Maintenance window scheduled for 02:00 UTC — will action then"
+    }
+    ```
+  </Tab>
+  <Tab title="Response (409)">
+    ```json
+    {
+      "detail": "El incidente no está en estado 'Esperando aprobación'"
+    }
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Error Reference
+
+| Status Code | Scenario |
+|---|---|
+| `400` | `command` does not match `proposed_action`, or command fails whitelist validation |
+| `401` | Missing or invalid JWT |
+| `404` | Incident UUID does not exist |
+| `409` | Incident is not in `awaiting_approval`, or action was already claimed by a concurrent request |

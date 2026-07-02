@@ -1,0 +1,252 @@
+---
+title: "Health Check API: Monitor Sentinel Service Dependencies"
+sidebarTitle: "Health"
+description: "The GET /api/health endpoint pings all Sentinel dependencies — Prometheus, Loki, ChromaDB, Alertmanager, LangFuse, and Supabase — and returns an aggregate health status."
+---
+
+Sentinel exposes two health endpoints: a lightweight liveness probe at `GET /health` (root level) and a full integration health check at `GET /api/health`. The integration check pings all six external service dependencies with a 3-second timeout and returns an aggregate status that reflects the overall health of the system. Both endpoints require no authentication, making them suitable for use with uptime monitors, container health checks, and load balancer probes.
+
+---
+
+## GET /health
+
+Simple liveness probe. Returns immediately with a static `healthy` response. Use this endpoint for container `HEALTHCHECK` directives and load balancer health probes.
+
+**Auth required:** No
+
+```bash
+curl https://sentinel-softserve.onrender.com/health
+```
+
+```json
+{"status": "healthy"}
+```
+
+| Always returns | `200 OK` |
+|---|---|
+| Response body | `{"status": "healthy"}` |
+
+---
+
+## GET /api/health
+
+Full integration health check. Pings all six service dependencies in parallel, measures latency, and returns an aggregate status. Use this endpoint for dashboards, alerting, and diagnosing connectivity issues.
+
+**Auth required:** No
+
+### Services Checked
+
+| Service key | Environment variable | Default URL |
+|---|---|---|
+| `prometheus` | `PROMETHEUS_URL` | `http://localhost:9090` |
+| `loki` | `LOKI_URL` | `http://localhost:3100` |
+| `chromadb` | `CHROMA_HOST` | `http://localhost:8001` |
+| `alertmanager` | `ALERTMANAGER_URL` | `http://localhost:9093` |
+| `langfuse` | `LANGFUSE_HOST` | `http://localhost:3001` |
+| `supabase` | `SUPABASE_URL` (via client) | Tested with `SELECT id FROM incidents LIMIT 1` |
+
+<Note>
+  HTTP services are considered **reachable** if any response is received — even `401 Unauthorized` or `404 Not Found`. Only connection errors and timeouts are treated as failures. The Supabase check uses the Supabase PostgREST client directly rather than an HTTP ping.
+</Note>
+
+### Aggregate Status Logic
+
+The top-level `status` field in the response is derived from the number of failed service checks:
+
+| Error count | Aggregate status |
+|---|---|
+| 0 | `healthy` |
+| 1–2 | `degraded` |
+| 3 or more | `critical` |
+
+### Response Schema
+
+<ResponseField name="status" type="string">
+  Aggregate health status: `healthy`, `degraded`, or `critical`.
+</ResponseField>
+
+<ResponseField name="services" type="object">
+  Map of service names to their individual health results.
+</ResponseField>
+
+<ResponseField name="services.[name].status" type="string">
+  `ok` if reachable, `error` if the connection failed or timed out.
+</ResponseField>
+
+<ResponseField name="services.[name].url" type="string">
+  The URL that was pinged. Omitted for `supabase`.
+</ResponseField>
+
+<ResponseField name="services.[name].latency_ms" type="integer">
+  Round-trip latency in milliseconds. Present only when `status` is `ok`. Omitted for `supabase`.
+</ResponseField>
+
+<ResponseField name="services.[name].error" type="string">
+  Error description. Present only when `status` is `error`. One of `"Connection refused"`, `"Timeout (3s)"`, or a generic exception message.
+</ResponseField>
+
+### Example Responses
+
+<Tabs>
+  <Tab title="All healthy">
+    ```json
+    {
+      "status": "healthy",
+      "services": {
+        "prometheus": {
+          "status": "ok",
+          "url": "http://localhost:9090",
+          "latency_ms": 12
+        },
+        "loki": {
+          "status": "ok",
+          "url": "http://localhost:3100",
+          "latency_ms": 8
+        },
+        "chromadb": {
+          "status": "ok",
+          "url": "http://localhost:8001",
+          "latency_ms": 15
+        },
+        "alertmanager": {
+          "status": "ok",
+          "url": "http://localhost:9093",
+          "latency_ms": 6
+        },
+        "langfuse": {
+          "status": "ok",
+          "url": "http://localhost:3001",
+          "latency_ms": 23
+        },
+        "supabase": {
+          "status": "ok"
+        }
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="Degraded (1 error)">
+    ```json
+    {
+      "status": "degraded",
+      "services": {
+        "prometheus": {
+          "status": "ok",
+          "url": "http://localhost:9090",
+          "latency_ms": 11
+        },
+        "loki": {
+          "status": "error",
+          "url": "http://localhost:3100",
+          "error": "Connection refused"
+        },
+        "chromadb": {
+          "status": "ok",
+          "url": "http://localhost:8001",
+          "latency_ms": 14
+        },
+        "alertmanager": {
+          "status": "ok",
+          "url": "http://localhost:9093",
+          "latency_ms": 7
+        },
+        "langfuse": {
+          "status": "ok",
+          "url": "http://localhost:3001",
+          "latency_ms": 19
+        },
+        "supabase": {
+          "status": "ok"
+        }
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="Critical (3+ errors)">
+    ```json
+    {
+      "status": "critical",
+      "services": {
+        "prometheus": {
+          "status": "error",
+          "url": "http://localhost:9090",
+          "error": "Connection refused"
+        },
+        "loki": {
+          "status": "error",
+          "url": "http://localhost:3100",
+          "error": "Connection refused"
+        },
+        "chromadb": {
+          "status": "error",
+          "url": "http://localhost:8001",
+          "error": "Timeout (3s)"
+        },
+        "alertmanager": {
+          "status": "ok",
+          "url": "http://localhost:9093",
+          "latency_ms": 5
+        },
+        "langfuse": {
+          "status": "ok",
+          "url": "http://localhost:3001",
+          "latency_ms": 21
+        },
+        "supabase": {
+          "status": "error",
+          "error": "could not connect to server"
+        }
+      }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Usage Examples
+
+<Tabs>
+  <Tab title="cURL">
+    ```bash
+    curl https://sentinel-softserve.onrender.com/api/health | jq .status
+    ```
+  </Tab>
+  <Tab title="Docker HEALTHCHECK">
+    ```dockerfile
+    HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+      CMD curl -f http://localhost:8000/health || exit 1
+    ```
+  </Tab>
+  <Tab title="Python (requests)">
+    ```python
+    import requests
+
+    response = requests.get("https://sentinel-softserve.onrender.com/api/health", timeout=10)
+    health = response.json()
+
+    if health["status"] == "critical":
+        send_pager_alert(f"Sentinel is CRITICAL: {health['services']}")
+    ```
+  </Tab>
+</Tabs>
+
+<Tip>
+  For production uptime monitoring, poll `GET /health` (liveness) every 30 seconds and `GET /api/health` (integration) every 60 seconds. Alert on `critical` status; notify (but do not page) on `degraded`.
+</Tip>
+
+---
+
+## Configuring Service URLs
+
+Override the default service URLs via environment variables on the backend container:
+
+```bash
+PROMETHEUS_URL=http://prometheus:9090
+LOKI_URL=http://loki:3100
+CHROMA_HOST=http://chromadb:8001
+ALERTMANAGER_URL=http://alertmanager:9093
+LANGFUSE_HOST=http://langfuse:3001
+```
+
+In Docker Compose deployments, use the service names as hostnames (e.g. `http://prometheus:9090`) rather than `localhost`.

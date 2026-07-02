@@ -1,0 +1,154 @@
+---
+title: "Configure Sentinel Environment Variables"
+sidebarTitle: "Configuration"
+description: "All environment variables for the Sentinel backend and frontend, including Supabase credentials, OpenAI API key, LangFuse observability, CORS settings, and webhook authentication."
+---
+
+Sentinel is configured entirely through environment variables. The backend reads from `Backend/.env` and the frontend reads from `Frontend/.env.local`. Neither file is committed to the repository — you must create them from the examples below before starting the application.
+
+<Tabs>
+  <Tab title="Backend (.env)">
+
+    Create the file at `Backend/.env`. All variables marked **required** must be set before the backend will start successfully.
+
+    ### Supabase
+
+    | Variable | Required | Description |
+    |---|---|---|
+    | `SUPABASE_URL` | ✅ | Your Supabase project URL, e.g. `https://xxxx.supabase.co` |
+    | `SUPABASE_SERVICE_KEY` | ✅ | Supabase **service role** key — used by the backend for privileged database access |
+    | `SUPABASE_JWT_SECRET` | ✅ | JWT secret for validating user tokens (found in Supabase → Project Settings → API) |
+
+    ### OpenAI
+
+    | Variable | Required | Default | Description |
+    |---|---|---|---|
+    | `OPENAI_API_KEY` | ✅ | — | OpenAI API key (`sk-...`) used by all LangGraph agents |
+    | `OPENAI_MODEL` | No | `gpt-4o-mini` | Model name passed to every LLM call |
+
+    ### LangFuse observability
+
+    | Variable | Required | Default | Description |
+    |---|---|---|---|
+    | `LANGFUSE_PUBLIC_KEY` | No | — | LangFuse public key (`pk-lf-...`) for tracing agent runs |
+    | `LANGFUSE_SECRET_KEY` | No | — | LangFuse secret key (`sk-lf-...`) |
+    | `LANGFUSE_HOST` | No | `http://localhost:3001` | LangFuse server URL — set to the Docker service name when running inside Compose |
+
+    ### Infrastructure URLs
+
+    | Variable | Required | Default | Description |
+    |---|---|---|---|
+    | `LOKI_URL` | No | `http://localhost:3100` | Loki log query endpoint used by the investigation agents |
+    | `CHROMA_HOST` | No | `http://localhost:8001` | ChromaDB HTTP endpoint for RAG and episodic memory |
+    | `PROMETHEUS_URL` | No | `http://localhost:9090` | Prometheus query API |
+    | `ALERTMANAGER_URL` | No | `http://localhost:9093` | Alertmanager management API |
+
+    <Note>
+    Inside Docker Compose, the service names replace `localhost` in these URLs. The `docker-compose.yml` overrides them automatically (e.g. `CHROMA_HOST=http://chromadb:8000`). The values in `Backend/.env` are the defaults used when running the backend **outside** of Compose (e.g. `uvicorn main:app --reload`).
+    </Note>
+
+    ### Webhook authentication
+
+    | Variable | Required | Description |
+    |---|---|---|
+    | `ALERT_WEBHOOK_SECRET` | ✅ | Shared secret for the `/api/alerts` webhook endpoint. Must match the `credentials` value in `alertmanager/alertmanager.yml`. |
+
+    <Warning>
+    `ALERT_WEBHOOK_SECRET` must be identical in `Backend/.env` and in `alertmanager/alertmanager.yml` under `http_config.authorization.credentials`. If they differ, Alertmanager's POST requests will be rejected with HTTP 401 and no incidents will be created automatically. In development you may omit the variable to leave the webhook open, but this is not safe in any shared environment.
+    </Warning>
+
+    ### CORS
+
+    | Variable | Required | Default | Description |
+    |---|---|---|---|
+    | `CORS_ORIGINS` | No | `http://localhost:5173,http://127.0.0.1:5173` | Comma-separated list of allowed origins for browser requests |
+    | `CORS_ORIGIN_REGEX` | No | — | Optional regex pattern for dynamically matching allowed origins (e.g. `https://.*\.yourdomain\.com`) |
+
+    ### PostgreSQL (demo instance)
+
+    The demo PostgreSQL instance started by Compose is reachable via either a full DSN or individual variables:
+
+    | Variable | Default | Description |
+    |---|---|---|
+    | `POSTGRES_DSN` | — | Full connection DSN, e.g. `postgresql://sentinel:sentinel123@localhost:5433/sentinel_demo`. Takes precedence over individual vars. |
+    | `POSTGRES_HOST` | — | PostgreSQL hostname |
+    | `POSTGRES_PORT` | — | PostgreSQL port |
+    | `POSTGRES_USER` | — | PostgreSQL user |
+    | `POSTGRES_PASSWORD` | — | PostgreSQL password |
+    | `POSTGRES_DB` | — | PostgreSQL database name |
+
+    ### Runtime sockets and paths
+
+    | Variable | Default | Description |
+    |---|---|---|
+    | `DOCKER_HOST` | `unix:///var/run/docker.sock` | Docker daemon socket — used by `DockerAgent` |
+    | `PODMAN_HOST` | `unix:///run/podman/podman.sock` | Podman socket — used by `PodmanAgent` (Linux only) |
+    | `KUBECONFIG` | `/root/.kube/config` | Path to the Kubernetes config file inside the container |
+    | `K8S_PROXY_URL` | _(empty)_ | kubectl proxy URL for Docker Desktop environments where `127.0.0.1:6443` is unreachable from containers |
+
+    ### Complete example
+
+    ```env
+    # Backend/.env
+
+    # ── Supabase ──────────────────────────────────────────────────────────────
+    SUPABASE_URL=https://your-project.supabase.co
+    SUPABASE_SERVICE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+    SUPABASE_JWT_SECRET=your-jwt-secret
+
+    # ── OpenAI ────────────────────────────────────────────────────────────────
+    OPENAI_API_KEY=sk-...
+    OPENAI_MODEL=gpt-4o-mini
+
+    # ── LangFuse ──────────────────────────────────────────────────────────────
+    LANGFUSE_PUBLIC_KEY=pk-lf-...
+    LANGFUSE_SECRET_KEY=sk-lf-...
+    LANGFUSE_HOST=http://localhost:3001
+
+    # ── Infrastructure (localhost defaults for running outside Docker) ─────────
+    LOKI_URL=http://localhost:3100
+    CHROMA_HOST=http://localhost:8001
+    PROMETHEUS_URL=http://localhost:9090
+    ALERTMANAGER_URL=http://localhost:9093
+
+    # ── Webhook ───────────────────────────────────────────────────────────────
+    ALERT_WEBHOOK_SECRET=sentinel-webhook-secret-change-me
+
+    # ── CORS ──────────────────────────────────────────────────────────────────
+    CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+
+    # ── PostgreSQL demo ───────────────────────────────────────────────────────
+    POSTGRES_DSN=postgresql://sentinel:sentinel123@localhost:5433/sentinel_demo
+
+    # ── Kubernetes (Docker Desktop) ───────────────────────────────────────────
+    # K8S_PROXY_URL=http://192.168.x.x:8555
+    ```
+
+  </Tab>
+
+  <Tab title="Frontend (.env.local)">
+
+    Create the file at `Frontend/.env.local`. All three variables are required for the frontend to authenticate users and communicate with the backend.
+
+    | Variable | Required | Default | Description |
+    |---|---|---|---|
+    | `VITE_SUPABASE_URL` | ✅ | — | Supabase project URL — same value as `SUPABASE_URL` in the backend |
+    | `VITE_SUPABASE_ANON_KEY` | ✅ | — | Supabase **anonymous** (public) key — used by the browser Supabase client for auth and Realtime |
+    | `VITE_API_URL` | No | `http://localhost:8000` | Backend API base URL used by all frontend API calls |
+
+    <Note>
+    The frontend uses the **anon key**, not the service role key. The anon key is safe to expose in browser code because access is governed by Row Level Security policies in Supabase.
+    </Note>
+
+    ### Complete example
+
+    ```env
+    # Frontend/.env.local
+
+    VITE_SUPABASE_URL=https://your-project.supabase.co
+    VITE_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+    VITE_API_URL=http://localhost:8000
+    ```
+
+  </Tab>
+</Tabs>

@@ -1,0 +1,134 @@
+---
+title: "Set Up the Sentinel Database Schema in Supabase"
+sidebarTitle: "Database Setup"
+description: "Apply Sentinel's Supabase migrations to create the incidents and incident_events tables, indexes, RLS policies, and Realtime subscription required by the backend."
+---
+
+Sentinel stores every incident and its status-transition timeline in Supabase (PostgreSQL). The schema lives in `supabase/migrations/` and consists of two migration files that must be applied in order. The backend will fail to start correctly if the `incidents` table does not exist, so apply the migrations before running `docker compose up -d` for the first time.
+
+<Note>
+**Fresh project vs. existing project:** If you are setting up a brand-new Supabase project, apply both migration files in order — `0001_initial_schema.sql` first, then `0002_production_hardening.sql`. If you are working with the team's existing Supabase project, the baseline schema is already in place — apply only `0002_production_hardening.sql`, which is safe to run on top of an existing installation (it only adds columns and indexes).
+</Note>
+
+## How to apply migrations
+
+<Tabs>
+  <Tab title="Supabase SQL Editor">
+    <Steps>
+      <Step title="Open the SQL Editor">
+        Go to your Supabase project → **SQL Editor** in the left sidebar, then click **New query**.
+      </Step>
+      <Step title="Apply the initial schema">
+        Open `supabase/migrations/0001_initial_schema.sql` in your editor, paste the full contents into the SQL Editor, and click **Run**.
+      </Step>
+      <Step title="Apply production hardening">
+        Open `supabase/migrations/0002_production_hardening.sql`, paste its contents into a new query tab, and click **Run**.
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="Supabase CLI">
+    If you have the [Supabase CLI](https://supabase.com/docs/guides/cli) installed and linked to your project, push all pending migrations in one command:
+
+    ```bash
+    supabase db push
+    ```
+
+    This applies all files under `supabase/migrations/` in lexicographic order, skipping any that have already been applied.
+  </Tab>
+</Tabs>
+
+## Migration 0001 — Initial schema
+
+`supabase/migrations/0001_initial_schema.sql` creates the core tables, indexes, and enables Supabase Realtime on the `incidents` table. It also enables the `pgcrypto` extension for UUID generation.
+
+### `incidents` table
+
+This is the primary table — every alert received by the backend becomes a row here.
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `uuid` | PK, `default gen_random_uuid()` | Unique incident identifier |
+| `title` | `text` | `NOT NULL` | Human-readable incident title |
+| `target` | `text` | `NOT NULL` | Container name, pod name, or database identifier affected |
+| `severity` | `text` | `NOT NULL`, check: `critical`, `high`, `medium`, `low` | Incident severity classified by the agent |
+| `status` | `text` | `NOT NULL`, default `detected`, check (enum below) | Current lifecycle state of the incident |
+| `source_type` | `text` | `NOT NULL`, default `container`, check: `container`, `database`, `manual` | Origin type of the alert |
+| `container_runtime` | `text` | check: `docker`, `podman`, `kubernetes` | Container runtime, when `source_type = container` |
+| `incident_type` | `text` | — | Classified incident sub-type (e.g. `oom`, `app_crash`, `connection_exhaustion`) |
+| `logs` | `text` | — | Raw log snippet collected from Loki at detection time |
+| `server_name` | `text` | — | Host or node name where the incident occurred |
+| `agent_reasoning` | `text` | — | Full agent reasoning trace from the investigation step |
+| `proposed_action` | `text` | — | Corrective action proposed by the agent and presented for human approval |
+| `action_result` | `text` | — | Output of the executed action after engineer approval |
+| `action_error` | `text` | — | Error message if the action execution failed |
+| `metrics_snapshot` | `jsonb` | — | Prometheus metrics snapshot captured at detection time |
+| `post_mortem_md` | `text` | — | Markdown post-mortem report generated after incident resolution |
+| `post_mortem_updated_at` | `timestamptz` | — | Timestamp of the last post-mortem update |
+| `executed_at` | `timestamptz` | — | When the approved corrective action was executed |
+| `resolved_at` | `timestamptz` | — | When the incident reached `resolved` status |
+| `created_at` | `timestamptz` | `NOT NULL`, default `now()` | When the incident was first created |
+| `updated_at` | `timestamptz` | — | Last update timestamp (set by the backend on every write) |
+
+**`status` allowed values:**
+
+```
+detected → investigating → analyzed → awaiting_approval
+→ executing_solution → verifying → resolved | failed
+```
+
+**Indexes created:**
+
+```sql
+idx_incidents_status      ON public.incidents (status)
+idx_incidents_target      ON public.incidents (target)
+idx_incidents_created_at  ON public.incidents (created_at DESC)
+```
+
+### `incident_events` table
+
+An append-only timeline of every status transition for each incident. The frontend uses this to render the incident timeline view.
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `uuid` | PK, `default gen_random_uuid()` | Unique event identifier |
+| `incident_id` | `uuid` | `NOT NULL`, FK → `incidents(id) ON DELETE CASCADE` | Parent incident |
+| `status` | `text` | `NOT NULL` | The status the incident transitioned to |
+| `created_at` | `timestamptz` | `NOT NULL`, default `now()` | When the transition occurred |
+
+**Index created:**
+
+```sql
+idx_incident_events_incident_id  ON public.incident_events (incident_id, created_at)
+```
+
+### Supabase Realtime
+
+The migration enables Supabase Realtime on the `incidents` table so the React frontend can subscribe to live row-level changes without polling:
+
+```sql
+ALTER PUBLICATION supabase_realtime ADD TABLE public.incidents;
+```
+
+The frontend subscribes to this publication on mount and updates the dashboard in real time whenever an incident is inserted or its status changes.
+
+## Migration 0002 — Production hardening
+
+`supabase/migrations/0002_production_hardening.sql` adds two columns and a partial unique index to the `incidents` table. It is safe to apply to an existing database — all statements use `ADD COLUMN IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS`.
+
+### New columns
+
+| Column | Type | Description |
+|---|---|---|
+| `approved_by` | `text` | Records which engineer approved, rejected, or postponed a proposed action — provides a human-in-the-loop audit trail |
+| `fingerprint` | `text` | Deduplication key sent by Alertmanager with each alert. Used to prevent duplicate active incidents for the same underlying alert. |
+
+### Partial unique index
+
+```sql
+CREATE UNIQUE INDEX uniq_incidents_active_fingerprint
+    ON public.incidents (fingerprint)
+    WHERE fingerprint IS NOT NULL
+      AND status NOT IN ('resolved', 'failed');
+```
+
+This index enforces at the database level that no two **active** incidents share the same Alertmanager fingerprint. Resolved and failed incidents are excluded from the uniqueness constraint so the same alert can fire again after it has been resolved. This eliminates the race condition that could otherwise arise from a check-then-insert pattern in the backend.

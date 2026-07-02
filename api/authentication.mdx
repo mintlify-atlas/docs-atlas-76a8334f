@@ -1,0 +1,156 @@
+---
+title: "Authenticate with the Sentinel API Using Supabase JWT"
+sidebarTitle: "Authentication"
+description: "How to obtain a Supabase JWT access token and pass it in the Authorization header for all Sentinel API requests. Covers email/password auth and the /api/alerts webhook secret."
+---
+
+Sentinel uses Supabase as its identity provider. Every API request to a protected endpoint must carry a valid Supabase JSON Web Token (JWT) in the `Authorization` header. The backend validates the token signature, extracts the caller's identity, and attaches it to audit fields such as `approved_by` on actions. This page explains how to obtain a token, how the backend validates it, and how the separate webhook secret works for the Alertmanager integration.
+
+## Protected vs. Open Endpoints
+
+| Endpoint | Auth required |
+|---|---|
+| All `/api/incidents/*` endpoints | ✅ Bearer JWT |
+| `POST /api/execute-action` | ✅ Bearer JWT |
+| `POST /api/incidents/{id}/reject` | ✅ Bearer JWT |
+| `POST /api/incidents/{id}/postpone` | ✅ Bearer JWT |
+| `POST /api/alerts` | ❌ Webhook secret (see below) |
+| `GET /api/health` | ❌ Open |
+| `GET /health` | ❌ Open |
+
+## Authorization Header Format
+
+Pass the Supabase access token as a Bearer credential on every protected request:
+
+```
+Authorization: Bearer <supabase-jwt-token>
+```
+
+A missing or malformed header returns `401 Unauthorized` with the body:
+
+```json
+{"detail": "Token inválido o expirado"}
+```
+
+## Obtaining a Token
+
+Supabase issues JWTs when a user authenticates with email and password. Use the official Supabase client library or the Supabase Auth REST API directly.
+
+<Tabs>
+  <Tab title="Python (supabase-py)">
+    ```python
+    from supabase import create_client
+
+    SUPABASE_URL = "https://<project-ref>.supabase.co"
+    SUPABASE_ANON_KEY = "<anon-key>"
+
+    client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+    response = client.auth.sign_in_with_password({
+        "email": "user@example.com",
+        "password": "password"
+    })
+
+    token = response.session.access_token
+    ```
+  </Tab>
+  <Tab title="JavaScript (supabase-js)">
+    ```javascript
+    import { createClient } from '@supabase/supabase-js'
+
+    const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email: 'user@example.com',
+      password: 'password',
+    })
+
+    const token = data.session.access_token
+    ```
+  </Tab>
+  <Tab title="cURL (REST)">
+    ```bash
+    curl -X POST "https://<project-ref>.supabase.co/auth/v1/token?grant_type=password" \
+      -H "apikey: <anon-key>" \
+      -H "Content-Type: application/json" \
+      -d '{"email":"user@example.com","password":"password"}'
+    ```
+  </Tab>
+</Tabs>
+
+The response includes `access_token` (the JWT), `refresh_token`, and expiry information. Use `access_token` in the `Authorization` header.
+
+## Using the Token
+
+<Tabs>
+  <Tab title="cURL">
+    ```bash
+    export TOKEN="<supabase-jwt-token>"
+
+    curl -H "Authorization: Bearer $TOKEN" \
+      https://sentinel-softserve.onrender.com/api/incidents
+    ```
+  </Tab>
+  <Tab title="Python (requests)">
+    ```python
+    import requests
+
+    headers = {"Authorization": f"Bearer {token}"}
+    response = requests.get(
+        "https://sentinel-softserve.onrender.com/api/incidents",
+        headers=headers,
+    )
+    print(response.json())
+    ```
+  </Tab>
+  <Tab title="JavaScript (fetch)">
+    ```javascript
+    const response = await fetch('https://sentinel-softserve.onrender.com/api/incidents', {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    })
+    const data = await response.json()
+    ```
+  </Tab>
+</Tabs>
+
+## JWT Validation Algorithms
+
+Sentinel's `auth.py` supports both JWT signing algorithms used by Supabase:
+
+| Algorithm | When used | Validation method |
+|---|---|---|
+| `HS256` | Self-hosted / older Supabase projects | `SUPABASE_JWT_SECRET` environment variable |
+| `ES256` | Supabase Cloud (newer projects) | Public key fetched from `{SUPABASE_URL}/auth/v1/.well-known/jwks.json` and cached in-process |
+
+The backend inspects the `alg` field in the JWT header and selects the appropriate validation path automatically. Audience (`aud`) verification is disabled to accommodate both service-role and anon-role tokens.
+
+<Note>
+  Set the `SUPABASE_JWT_SECRET` environment variable on the backend for HS256 token support. For ES256 (Supabase Cloud), the backend fetches the JWKS endpoint automatically using `SUPABASE_URL`.
+</Note>
+
+## JWT Payload Fields
+
+The decoded JWT payload provides two fields that Sentinel uses internally:
+
+| Field | Type | Usage |
+|---|---|---|
+| `sub` | string | Supabase user UUID; used as fallback identity |
+| `email` | string | Human-readable identity; preferred for `approved_by` audit field |
+
+When a user executes, rejects, or postpones an action, the `email` (or `sub` if email is absent) is recorded in the incident's `approved_by` field.
+
+## Alerts Webhook Secret
+
+The `POST /api/alerts` endpoint does **not** use Supabase JWTs. Instead it uses a shared secret configured via the `ALERT_WEBHOOK_SECRET` environment variable. Alertmanager sends this secret as a Bearer token in the same `Authorization` header format:
+
+```
+Authorization: Bearer <ALERT_WEBHOOK_SECRET value>
+```
+
+The backend compares the provided value against `ALERT_WEBHOOK_SECRET` using a constant-time HMAC digest comparison (`hmac.compare_digest`) to prevent timing attacks.
+
+<Warning>
+  If `ALERT_WEBHOOK_SECRET` is not set, the `/api/alerts` endpoint accepts **all** incoming requests without any authentication check. This behavior is intended for local development only. Always configure this secret in production deployments.
+</Warning>
+
+See the [Alerts](/api/alerts) page for Alertmanager configuration examples.

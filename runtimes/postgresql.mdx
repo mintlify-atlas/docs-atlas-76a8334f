@@ -1,0 +1,229 @@
+---
+title: "PostgreSQL Runtime: Database Incident Triage"
+sidebarTitle: "PostgreSQL"
+description: "Sentinel's PostgresAgent investigates database incidents with pg_stat_activity, pg_cancel_backend, and pg_terminate_backend — with safe, targeted connection management."
+---
+
+The **PostgresAgent** is Sentinel's specialist for database incidents. It connects to PostgreSQL via `psycopg2`, queries the `pg_stat_*` system views, and produces a structured diagnosis of connection exhaustion, deadlocks, long-running transactions, replication lag, and cache hit ratio degradation. Every action it proposes is a safe, targeted operation — from read-only observation (`pg_stat_activity`) to graceful query cancellation (`pg_cancel_backend`) or full connection termination (`pg_terminate_backend`) — and all require explicit human approval before execution.
+
+## Runtime Detection
+
+The PostgresAgent claims an alert when either of the following is true:
+
+1. The alert label `source_type=database` is set.
+2. The `target` field starts with `postgres/`.
+
+```python
+# services/agents/postgres/agent.py — PostgresAgent.matches()
+def matches(self, ctx: IncidentContext) -> bool:
+    source = (ctx.labels.get("source_type") or "").lower()
+    if source == "database":
+        return True
+    return ctx.target.lower().startswith("postgres/")
+```
+
+### Target Format
+
+PostgreSQL incidents must use the `postgres/<datname>` target format, where `<datname>` is the PostgreSQL database name:
+
+| Example target | Database name extracted |
+|----------------|------------------------|
+| `postgres/sentinel_demo` | `sentinel_demo` |
+| `postgres/myapp_prod` | `myapp_prod` |
+
+The agent extracts the database name from this path to filter all queries in its tools.
+
+## Prerequisites
+
+### Connection Configuration
+
+The tools build a connection DSN in the following priority order:
+
+<Steps>
+  <Step title="POSTGRES_DSN (preferred)">
+    Set the full connection string directly:
+
+    ```bash
+    POSTGRES_DSN=postgresql://sentinel:sentinel123@localhost:5432/sentinel_demo
+    ```
+  </Step>
+  <Step title="Individual connection variables">
+    If `POSTGRES_DSN` is not set, the agent assembles the DSN from individual variables:
+
+    | Variable | Default | Description |
+    |----------|---------|-------------|
+    | `POSTGRES_HOST` | `localhost` | PostgreSQL host |
+    | `POSTGRES_PORT` | `5432` | PostgreSQL port |
+    | `POSTGRES_USER` | `sentinel` | Database user |
+    | `POSTGRES_PASSWORD` | *(empty)* | Password |
+    | `POSTGRES_DB` | `sentinel_demo` | Database name for the connection |
+  </Step>
+</Steps>
+
+The demo PostgreSQL instance is provided by the `postgres-demo` service in `docker-compose.yml`, pre-configured with the `sentinel` user, `sentinel123` password, and `sentinel_demo` database. Its metrics are scraped by the `postgres-exporter` service:
+
+```yaml
+postgres-exporter:
+  image: prometheuscommunity/postgres-exporter:latest
+  environment:
+    DATA_SOURCE_NAME: "postgresql://sentinel:sentinel123@postgres-demo:5432/sentinel_demo?sslmode=disable"
+```
+
+This exporter enables Alertmanager rules such as `PostgresConnectionsExhausted` and `PostgresDeadlockDetected` to fire from real Prometheus metrics.
+
+## Tools
+
+All four tools are **read-only** — they use `SELECT` queries and never issue `INSERT`, `UPDATE`, `DELETE`, `DROP`, or any DDL. The tools connect with a short timeout (5 seconds) and close the connection after each call to avoid contributing to connection pressure during an incident.
+
+<CardGroup cols={2}>
+  <Card title="pg_stat_activity" icon="table">
+    Queries `pg_stat_activity` grouped by `(datname, state, wait_event_type, wait_event)`. Returns connection counts per state (`active`, `idle`, `idle in transaction`), max query duration, and total connections vs. `max_connections`. Use this to diagnose connection pool exhaustion or blocked queries.
+  </Card>
+  <Card title="pg_stat_database" icon="chart-bar">
+    Queries `pg_stat_database` for accumulated stats: transaction commits/rollbacks, deadlock count, disk reads vs. cache hits (used to compute cache hit ratio %), and table mutation rates (inserts/updates/deletes). Use this to detect deadlocks, poor cache hit ratio, or abnormal data churn.
+  </Card>
+  <Card title="pg_stat_replication" icon="arrows-left-right">
+    Queries `pg_stat_replication` for all connected standbys: write lag, flush lag, and replay lag in both seconds and bytes. Only returns data when the connected server is a primary with at least one replica. Use this for replication lag alerts.
+  </Card>
+  <Card title="pg_locks" icon="lock">
+    Joins `pg_locks` with `pg_stat_activity` to show active locks, waiting queries, lock modes, table names, and query text. Returns both granted and pending locks, ranked by duration. Use this to diagnose deadlocks or long-running transactions blocking others.
+  </Card>
+</CardGroup>
+
+### Tool Parameters
+
+| Tool | Parameter | Type | Default | Description |
+|------|-----------|------|---------|-------------|
+| `pg_stat_activity` | `datname` | `string` | `""` | Filter by database name; empty returns all non-template databases |
+| `pg_stat_database` | `datname` | `string` | `""` | Filter by database name; empty returns all non-template databases |
+| `pg_stat_replication` | *(none)* | — | — | Returns all replica connections |
+| `pg_locks` | `datname` | `string` | `""` | Filter by database name; empty returns all databases |
+
+## Action Proposals
+
+The Supervisor maps each `incident_type` to one of three safe database actions. The action operates on the `<datname>` extracted from the incident target (`postgres/<datname>`).
+
+<Tabs>
+  <Tab title="pg_terminate_backend">
+    Terminates **all connections** to the named database. This is the most aggressive action and is reserved for incidents where the database is effectively unreachable due to saturation or cascading failures.
+
+    | Incident type | Proposed action |
+    |---------------|-----------------|
+    | `app_crash` | `pg_terminate_backend <datname>` |
+    | `dependency_failure` | `pg_terminate_backend <datname>` |
+    | `restart_loop` | `pg_terminate_backend <datname>` |
+    | `memory_pressure` | `pg_terminate_backend <datname>` |
+
+    <Warning>
+      `pg_terminate_backend` disconnects **all active clients** from the specified database. Applications will immediately lose their connections and must reconnect. Use this action only when the database is already non-functional for those clients and a clean slate is necessary. Connection poolers (PgBouncer, pgpool) will automatically reconnect on the next query.
+    </Warning>
+  </Tab>
+  <Tab title="pg_cancel_backend">
+    Sends `SIGINT` to cancel the **currently active query** of each connection, without terminating the connection itself. The backend stays alive and can accept new queries immediately after cancellation.
+
+    | Incident type | Proposed action |
+    |---------------|-----------------|
+    | `cpu_throttling` | `pg_cancel_backend <datname>` |
+    | `network_error` | `pg_cancel_backend <datname>` |
+  </Tab>
+  <Tab title="pg_stat_activity (read-only)">
+    A pure observation — no side effects. Returns the current active connections and query states for the database without modifying anything.
+
+    | Incident type | Proposed action |
+    |---------------|-----------------|
+    | `oom` | `pg_stat_activity <datname>` |
+    | `config_error` | `pg_stat_activity <datname>` |
+    | `disk_pressure` | `pg_stat_activity <datname>` |
+    | `unknown` | `pg_stat_activity <datname>` |
+    | *(any other)* | `pg_stat_activity <datname>` |
+  </Tab>
+</Tabs>
+
+### Action Execution Details
+
+When the proposed action is approved, `routers/actions.py` executes it via `_run_pg_command`:
+
+| Action | SQL executed | Side effects |
+|--------|-------------|--------------|
+| `pg_stat_activity <datname>` | `SELECT pid, usename, state, ... FROM pg_stat_activity WHERE datname = %s` | None — read-only |
+| `pg_cancel_backend <datname>` | `SELECT pid, pg_cancel_backend(pid) FROM pg_stat_activity WHERE datname = %s AND state = 'active'` | Cancels active queries; connections remain alive |
+| `pg_terminate_backend <datname>` | `SELECT pid, pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s` | Terminates all connections to the database |
+
+All three commands run with `autocommit=True` and exclude the backend's own PID (`pid <> pg_backend_pid()`) to avoid self-termination.
+
+## Simulating an Incident
+
+The `demo_postgres.sh.example` script demonstrates a `PostgresConnectionsExhausted` incident against the `sentinel_demo` database. Here is the condensed simulation flow:
+
+<Steps>
+  <Step title="Ensure the demo database is running">
+    ```bash
+    docker compose up -d postgres-demo postgres-exporter
+    # Verify connectivity
+    docker exec sentinel-postgres-demo psql \
+      -U sentinel -d sentinel_demo -c "SELECT version();"
+    ```
+  </Step>
+  <Step title="Fire the alert">
+    ```bash
+    curl -s -X POST http://localhost:8000/api/alerts \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $TOKEN" \
+      -d '{
+        "status": "firing",
+        "alerts": [{
+          "status": "firing",
+          "labels": {
+            "alertname": "PostgresConnectionsExhausted",
+            "severity": "critical",
+            "datname": "sentinel_demo",
+            "source_type": "database"
+          },
+          "annotations": {
+            "summary": "DB sentinel_demo has no available connections",
+            "description": "The connection pool for sentinel_demo is at 100%. New queries are being blocked."
+          },
+          "startsAt": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"
+        }]
+      }'
+    ```
+  </Step>
+  <Step title="Review the PostgresAgent analysis">
+    The agent calls `pg_stat_activity sentinel_demo` and `pg_stat_database sentinel_demo` to retrieve live connection counts, query states, and cache hit ratio. It cross-references the `runbooks-postgres` collection and any similar past incidents before proposing `pg_terminate_backend sentinel_demo` (classified as `dependency_failure` or `app_crash`).
+  </Step>
+  <Step title="Approve the action">
+    In the dashboard at `http://localhost:5173`, review the structured analysis and approve the proposed action. The backend executes `pg_terminate_backend` and transitions the incident to **Verifying**, then **Resolved**.
+  </Step>
+</Steps>
+
+## Investigation Flow
+
+```
+Alert received (source_type=database or target starts with postgres/)
+      │
+      ▼
+Supervisor classifies incident_type
+      │
+      ▼
+PostgresAgent.investigate(ctx)
+      ├── recall_runbooks("connections exhausted ...", k=3)  → runbooks-postgres
+      ├── recall_similar_incidents("...", k=3)              → incidents-postgres
+      │
+      ▼
+ReAct loop (max 4 iterations)
+      ├── pg_stat_activity <datname>      ← connection states, blocking queries
+      ├── pg_stat_database <datname>      ← deadlocks, cache hit ratio
+      ├── pg_locks <datname>              ← lock chains (if deadlock suspected)
+      └── pg_stat_replication             ← lag (if replication alert)
+      │
+      ▼
+Final analysis (markdown with Causa Raíz / Evidencia / Acciones)
+      │
+      ▼
+Supervisor._build_proposed_action()
+      │  ├── memory_pressure   → pg_terminate_backend sentinel_demo
+      │  ├── cpu_throttling    → pg_cancel_backend sentinel_demo
+      │  └── unknown           → pg_stat_activity sentinel_demo
+      ▼
+Status: awaiting_approval → human approves → verifying → resolved
+```

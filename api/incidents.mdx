@@ -1,0 +1,562 @@
+---
+title: "Incidents API: CRUD, Export, Runbooks, and Metrics Endpoints"
+sidebarTitle: "Incidents"
+description: "Complete reference for all /api/incidents endpoints: list with filters and pagination, get by ID, create manually, update status, retrieve post-mortem, export, runbooks, similar incidents, and metrics."
+---
+
+The Incidents API is the core of Sentinel SoftServe. It exposes endpoints to list, create, and inspect incidents, manage their lifecycle status, generate and save post-mortems, export full incident bundles, query relevant runbooks from ChromaDB, find similar past incidents via episodic memory, and fetch live Prometheus metrics. All endpoints require a valid Supabase JWT Bearer token.
+
+## Incident Status Lifecycle
+
+Incidents move through the following statuses as the LangGraph agent pipeline and human operators interact with them:
+
+| Status | Description |
+|---|---|
+| `detected` | Incident created; not yet analyzed |
+| `investigating` | Agent is gathering logs and metrics |
+| `analyzed` | Agent has produced a diagnosis and proposed action |
+| `awaiting_approval` | Proposed action is pending human review |
+| `executing_solution` | Action is actively being executed |
+| `verifying` | Post-execution verification in progress |
+| `resolved` | Incident fully resolved |
+| `failed` | Execution failed or action was rejected |
+
+`resolved` and `failed` are terminal statuses. The `active` filter alias matches all non-terminal statuses.
+
+---
+
+## GET /api/incidents
+
+List all incidents with optional filtering and pagination.
+
+**Auth required:** Yes
+
+<ParamField query="source_type" type="string">
+  Filter by incident source. One of `container`, `database`, or `manual`.
+</ParamField>
+
+<ParamField query="container_runtime" type="string">
+  Filter by container runtime. One of `docker`, `podman`, or `kubernetes`.
+</ParamField>
+
+<ParamField query="severity" type="string">
+  Filter by severity level. One of `critical`, `high`, `medium`, or `low`.
+</ParamField>
+
+<ParamField query="status" type="string">
+  Filter by status. Pass an exact `StatusType` value, or the special alias `active` to return all incidents not in `resolved` or `failed`.
+</ParamField>
+
+<ParamField query="page" type="integer" default="1">
+  Page number (1-based).
+</ParamField>
+
+<ParamField query="limit" type="integer" default="20">
+  Number of incidents per page.
+</ParamField>
+
+**Response**
+
+<ResponseField name="data" type="array">
+  Array of incident objects for the current page.
+</ResponseField>
+
+<ResponseField name="total" type="integer">
+  Total number of incidents matching the applied filters.
+</ResponseField>
+
+<ResponseField name="page" type="integer">
+  Current page number.
+</ResponseField>
+
+<ResponseField name="limit" type="integer">
+  Page size used for this response.
+</ResponseField>
+
+<ResponseField name="pages" type="integer">
+  Total number of pages (`ceil(total / limit)`).
+</ResponseField>
+
+<Tabs>
+  <Tab title="Request">
+    ```bash
+    curl -H "Authorization: Bearer $TOKEN" \
+      "https://sentinel-softserve.onrender.com/api/incidents?status=active&severity=critical&page=1&limit=10"
+    ```
+  </Tab>
+  <Tab title="Response">
+    ```json
+    {
+      "data": [
+        {
+          "id": "3f7a1b2c-...",
+          "title": "ContainerDown: my-service",
+          "target": "my-service",
+          "severity": "critical",
+          "status": "awaiting_approval",
+          "source_type": "container",
+          "container_runtime": "docker",
+          "proposed_action": "docker restart my-service",
+          "created_at": "2024-06-01T12:00:00Z"
+        }
+      ],
+      "total": 1,
+      "page": 1,
+      "limit": 10,
+      "pages": 1
+    }
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## POST /api/incidents
+
+Create a manual incident and immediately trigger the LangGraph analysis pipeline as a background task.
+
+**Auth required:** Yes  
+**Status code:** `201 Created`
+
+<ParamField body="title" type="string" required>
+  Short description of the incident. Maximum 200 characters.
+</ParamField>
+
+<ParamField body="target" type="string" required>
+  The affected resource — a container name, database name, or service identifier. Maximum 100 characters.
+</ParamField>
+
+<ParamField body="severity" type="string" required>
+  Severity level: `critical`, `high`, `medium`, or `low`.
+</ParamField>
+
+<ParamField body="source_type" type="string" default="manual">
+  Origin of the incident: `container`, `database`, or `manual`.
+</ParamField>
+
+<ParamField body="description" type="string">
+  Optional free-text description or initial log snippet. Maximum 5000 characters. Stored as the incident's initial `logs` field.
+</ParamField>
+
+<Note>
+  When `source_type` is `container`, `container_runtime` defaults to `docker`. For `database` and `manual` sources, `container_runtime` is set to `null`.
+</Note>
+
+<Tabs>
+  <Tab title="Request">
+    ```bash
+    curl -X POST \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "title": "API gateway returning 503",
+        "target": "api-gateway",
+        "severity": "high",
+        "source_type": "container",
+        "description": "Health check endpoint returning 503 since 14:32 UTC"
+      }' \
+      https://sentinel-softserve.onrender.com/api/incidents
+    ```
+  </Tab>
+  <Tab title="Response (201)">
+    ```json
+    {
+      "id": "a1b2c3d4-e5f6-...",
+      "title": "API gateway returning 503",
+      "target": "api-gateway",
+      "severity": "high",
+      "status": "detected",
+      "source_type": "container",
+      "container_runtime": "docker",
+      "logs": "Health check endpoint returning 503 since 14:32 UTC",
+      "created_at": "2024-06-01T14:35:00Z"
+    }
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## GET /api/incidents/{incident_id}
+
+Retrieve a single incident by its UUID.
+
+**Auth required:** Yes
+
+<ParamField path="incident_id" type="string" required>
+  UUID of the incident.
+</ParamField>
+
+Returns `404 Not Found` with `{"detail": "Incidente no encontrado"}` if the ID does not exist.
+
+<Tabs>
+  <Tab title="Request">
+    ```bash
+    curl -H "Authorization: Bearer $TOKEN" \
+      https://sentinel-softserve.onrender.com/api/incidents/a1b2c3d4-e5f6-7890-abcd-ef1234567890
+    ```
+  </Tab>
+  <Tab title="Response">
+    ```json
+    {
+      "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "title": "API gateway returning 503",
+      "target": "api-gateway",
+      "severity": "high",
+      "status": "analyzed",
+      "source_type": "container",
+      "container_runtime": "docker",
+      "incident_type": "container_crash",
+      "agent_reasoning": "Container exited with OOM error...",
+      "proposed_action": "docker restart api-gateway",
+      "action_result": null,
+      "action_error": null,
+      "executed_at": null,
+      "resolved_at": null,
+      "created_at": "2024-06-01T14:35:00Z",
+      "updated_at": "2024-06-01T14:36:10Z"
+    }
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## PATCH /api/incidents/{incident_id}/status
+
+Update the status of an incident. If the new status is `resolved`, a post-mortem generation job is queued as a background task.
+
+**Auth required:** Yes
+
+<ParamField path="incident_id" type="string" required>
+  UUID of the incident.
+</ParamField>
+
+<ParamField body="status" type="string" required>
+  The new status. Must be a valid `StatusType`: `detected`, `investigating`, `analyzed`, `awaiting_approval`, `executing_solution`, `verifying`, `resolved`, or `failed`.
+</ParamField>
+
+<Note>
+  Setting status to `resolved` also writes the current UTC timestamp to `resolved_at` and schedules post-mortem generation in the background.
+</Note>
+
+<Tabs>
+  <Tab title="Request">
+    ```bash
+    curl -X PATCH \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{"status": "resolved"}' \
+      https://sentinel-softserve.onrender.com/api/incidents/a1b2c3d4-.../status
+    ```
+  </Tab>
+  <Tab title="Response">
+    ```json
+    [
+      {
+        "id": "a1b2c3d4-...",
+        "status": "resolved",
+        "resolved_at": "2024-06-01T15:00:00Z"
+      }
+    ]
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## GET /api/incidents/{incident_id}/post-mortem
+
+Retrieve the post-mortem report for an incident. If the incident is `resolved` but no post-mortem has been saved yet, one is generated on demand synchronously.
+
+**Auth required:** Yes
+
+<ParamField path="incident_id" type="string" required>
+  UUID of the incident.
+</ParamField>
+
+<ResponseField name="incident_id" type="string">
+  UUID of the incident.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Current incident status.
+</ResponseField>
+
+<ResponseField name="content" type="string">
+  Markdown-formatted post-mortem content. Empty string if not yet available.
+</ResponseField>
+
+<ResponseField name="updated_at" type="string">
+  ISO 8601 timestamp of the last update, or `null`.
+</ResponseField>
+
+<ResponseField name="generated" type="boolean">
+  `true` if the post-mortem was generated on-demand during this request rather than loaded from a previously saved value.
+</ResponseField>
+
+<Tabs>
+  <Tab title="Request">
+    ```bash
+    curl -H "Authorization: Bearer $TOKEN" \
+      https://sentinel-softserve.onrender.com/api/incidents/a1b2c3d4-.../post-mortem
+    ```
+  </Tab>
+  <Tab title="Response">
+    ```json
+    {
+      "incident_id": "a1b2c3d4-...",
+      "status": "resolved",
+      "content": "## Post-Mortem: API gateway returning 503\n\n**Summary**: ...",
+      "updated_at": "2024-06-01T15:02:00Z",
+      "generated": false
+    }
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## PUT /api/incidents/{incident_id}/post-mortem
+
+Save or overwrite the post-mortem content for an incident. Useful for human-edited post-mortems after review.
+
+**Auth required:** Yes
+
+<ParamField path="incident_id" type="string" required>
+  UUID of the incident.
+</ParamField>
+
+<ParamField body="content" type="string" required>
+  Markdown string. Minimum 1 character, maximum 100,000 characters.
+</ParamField>
+
+<Tabs>
+  <Tab title="Request">
+    ```bash
+    curl -X PUT \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{"content": "## Post-Mortem\n\nEdited by on-call engineer..."}' \
+      https://sentinel-softserve.onrender.com/api/incidents/a1b2c3d4-.../post-mortem
+    ```
+  </Tab>
+  <Tab title="Response">
+    ```json
+    {
+      "incident_id": "a1b2c3d4-...",
+      "saved": true
+    }
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## GET /api/incidents/{incident_id}/export
+
+Export a complete incident bundle for archiving or sharing. Supports JSON and Markdown formats.
+
+**Auth required:** Yes
+
+<ParamField path="incident_id" type="string" required>
+  UUID of the incident.
+</ParamField>
+
+<ParamField query="format" type="string" default="json">
+  Output format: `json` or `markdown`. Any other value returns `400 Bad Request`.
+</ParamField>
+
+The JSON export payload includes the following top-level keys:
+
+| Key | Description |
+|---|---|
+| `metadata` | Core incident fields (title, severity, status, timestamps) |
+| `evidence.logs` | Raw log content captured during investigation |
+| `evidence.metrics_snapshot` | Prometheus metrics snapshot taken at incident time |
+| `evidence.agent_reasoning` | LangGraph agent's step-by-step analysis |
+| `timeline` | Ordered list of status transitions with timestamps |
+| `decisions` | Proposed and executed actions with outcomes |
+| `actions` | Detailed action execution records |
+| `post_mortem` | Post-mortem Markdown content (if available) |
+
+<Tabs>
+  <Tab title="Request (JSON)">
+    ```bash
+    curl -H "Authorization: Bearer $TOKEN" \
+      "https://sentinel-softserve.onrender.com/api/incidents/a1b2c3d4-.../export?format=json"
+    ```
+  </Tab>
+  <Tab title="Request (Markdown)">
+    ```bash
+    curl -H "Authorization: Bearer $TOKEN" \
+      "https://sentinel-softserve.onrender.com/api/incidents/a1b2c3d4-.../export?format=markdown" \
+      -o incident-report.md
+    ```
+  </Tab>
+  <Tab title="Response (JSON excerpt)">
+    ```json
+    {
+      "metadata": {
+        "id": "a1b2c3d4-...",
+        "title": "API gateway returning 503",
+        "severity": "high",
+        "status": "resolved",
+        "created_at": "2024-06-01T14:35:00Z",
+        "resolved_at": "2024-06-01T15:00:00Z"
+      },
+      "evidence": {
+        "logs": "...",
+        "metrics_snapshot": {...},
+        "agent_reasoning": "Container exited with OOM error..."
+      },
+      "timeline": [...],
+      "decisions": {...},
+      "actions": [...],
+      "post_mortem": "## Post-Mortem: ..."
+    }
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## GET /api/incidents/{incident_id}/runbooks
+
+Retrieve up to 5 relevant runbooks from the ChromaDB vector store for this incident. Runbooks are matched using semantic similarity against the incident's `incident_type` and `title`.
+
+**Auth required:** Yes
+
+<ParamField path="incident_id" type="string" required>
+  UUID of the incident.
+</ParamField>
+
+<ParamField query="q" type="string">
+  Optional custom query string to override the default search query (`{incident_type} {title}`). Useful for targeted runbook lookups.
+</ParamField>
+
+The runbook collection queried is determined by the incident's `source_type` and `container_runtime`:
+
+| Source | Runtime | ChromaDB Collection |
+|---|---|---|
+| `container` | `docker` | `runbooks-docker` |
+| `container` | `podman` | `runbooks-podman` |
+| `container` | `kubernetes` | `runbooks-kubernetes` |
+| `database` | — | `runbooks-postgres` |
+
+<ResponseField name="title" type="string">
+  Runbook title extracted from the `RUNBOOK: <title>` line in the document.
+</ResponseField>
+
+<ResponseField name="content" type="string">
+  Full runbook text content.
+</ResponseField>
+
+<Tabs>
+  <Tab title="Request">
+    ```bash
+    curl -H "Authorization: Bearer $TOKEN" \
+      "https://sentinel-softserve.onrender.com/api/incidents/a1b2c3d4-.../runbooks"
+    ```
+  </Tab>
+  <Tab title="Response">
+    ```json
+    [
+      {
+        "title": "Container OOM Recovery",
+        "content": "RUNBOOK: Container OOM Recovery\n\n1. Identify the container...\n2. Check memory limits..."
+      },
+      {
+        "title": "Docker Restart Procedure",
+        "content": "RUNBOOK: Docker Restart Procedure\n\n..."
+      }
+    ]
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## GET /api/incidents/{incident_id}/similar
+
+Find up to 5 similar past incidents using ChromaDB episodic memory. The query is built from the incident's `incident_type` and `title`. The current incident is excluded from results.
+
+**Auth required:** Yes
+
+<ParamField path="incident_id" type="string" required>
+  UUID of the incident.
+</ParamField>
+
+Returns an array of incident objects. The collection queried mirrors the runbook collection selection logic (`incidents-docker`, `incidents-postgres`, etc.).
+
+<Tabs>
+  <Tab title="Request">
+    ```bash
+    curl -H "Authorization: Bearer $TOKEN" \
+      https://sentinel-softserve.onrender.com/api/incidents/a1b2c3d4-.../similar
+    ```
+  </Tab>
+  <Tab title="Response">
+    ```json
+    [
+      {
+        "id": "9f8e7d6c-...",
+        "title": "API gateway OOM crash",
+        "severity": "high",
+        "status": "resolved",
+        "source_type": "container",
+        "container_runtime": "docker",
+        "created_at": "2024-05-15T09:22:00Z"
+      }
+    ]
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## GET /api/incidents/{incident_id}/metrics
+
+Fetch the current live Prometheus metrics for the incident's target resource. If Prometheus is unreachable but a `metrics_snapshot` was captured at incident creation time, the snapshot is returned as a fallback.
+
+**Auth required:** Yes
+
+<ParamField path="incident_id" type="string" required>
+  UUID of the incident.
+</ParamField>
+
+Metric source depends on `source_type`:
+
+| `source_type` | Data source | Query |
+|---|---|---|
+| `database` | Prometheus → PostgreSQL exporter | Queries using `datname` extracted from target (`postgres/<datname>`) |
+| `container` | Prometheus → cAdvisor | Queries using the container name as target |
+
+Returns `503 Service Unavailable` if Prometheus is unreachable **and** no `metrics_snapshot` fallback exists.
+
+<Tabs>
+  <Tab title="Request">
+    ```bash
+    curl -H "Authorization: Bearer $TOKEN" \
+      https://sentinel-softserve.onrender.com/api/incidents/a1b2c3d4-.../metrics
+    ```
+  </Tab>
+  <Tab title="Response (container)">
+    ```json
+    {
+      "cpu_usage_percent": 94.2,
+      "memory_usage_bytes": 536870912,
+      "memory_limit_bytes": 536870912,
+      "network_rx_bytes": 1024000,
+      "network_tx_bytes": 512000
+    }
+    ```
+  </Tab>
+  <Tab title="Response (503 – no fallback)">
+    ```json
+    {
+      "detail": "Métricas no disponibles: Connection refused"
+    }
+    ```
+  </Tab>
+</Tabs>

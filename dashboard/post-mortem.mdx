@@ -1,0 +1,108 @@
+---
+title: "Automated Post-Mortem Generation and Editing in Sentinel"
+sidebarTitle: "Post-Mortems"
+description: "How Sentinel automatically generates structured post-mortems with MTTR, timeline, root cause, and lessons learned when an incident is resolved — and how engineers can edit them."
+---
+
+When an incident reaches `resolved` status, Sentinel automatically generates a structured post-mortem document using GPT-4o-mini. The generation happens asynchronously as a FastAPI `BackgroundTask` so it never blocks the status update that the frontend receives in real time. Engineers can then review, edit, and export the post-mortem directly from the dashboard's **Post-Mortem** tab.
+
+## Generation Lifecycle
+
+<Steps>
+  <Step title="Incident resolves">
+    The verification service confirms the affected resource is healthy and sets `status = 'resolved'`, writing the `resolved_at` timestamp. The MTTR is computed as `resolved_at - created_at` and formatted as a human-readable string (e.g., `4m 32s`, `1h 12m`).
+  </Step>
+  <Step title="BackgroundTask triggers">
+    The FastAPI route handler schedules post-mortem generation as a background task immediately after committing the status update. This is non-blocking — the HTTP response is already on its way to the frontend before the LLM call starts.
+
+    ```python
+    # Conceptual FastAPI pattern used in Sentinel:
+    background_tasks.add_task(generate_post_mortem, incident_id)
+    ```
+  </Step>
+  <Step title="LLM generates the document">
+    GPT-4o-mini receives the full incident context as a prompt:
+
+    - `title`, `severity`, `target`, `incident_type`
+    - Container or query `logs`
+    - `agent_reasoning` (full investigation Markdown)
+    - Status `timeline` extracted from `incident_events`
+    - `proposed_action` and `action_result`
+    - Computed MTTR
+
+    The model returns a structured Markdown document saved to the `post_mortem_md` field in Supabase.
+  </Step>
+  <Step title="Engineer reviews in the Post-Mortem tab">
+    The `PostMortemEditor` component fetches the content via `GET /api/incidents/{id}/post-mortem` when the **Post-Mortem** tab is first opened. The content appears in a full-height Markdown textarea. The last-updated timestamp and character count are shown in the header.
+  </Step>
+  <Step title="Edit if needed">
+    The textarea is fully editable. Engineers can correct inaccuracies, add context, rewrite the lessons-learned section, or attach links to follow-up tickets. All edits are local until saved.
+  </Step>
+  <Step title="Save and export">
+    Click **Save** to persist changes via `PUT /api/incidents/{id}/post-mortem`. Click **Export .md** to download the current content as a Markdown file named `postmortem_<title>.md` — no save required before export.
+  </Step>
+</Steps>
+
+## Post-Mortem Structure
+
+The LLM is prompted to produce a structured Markdown document with the following sections:
+
+| Section | Contents |
+|---|---|
+| **Incident Summary** | Title, severity, target, incident type, and a one-paragraph executive summary |
+| **Timeline of Events** | Chronological list of status transitions with timestamps sourced from `incident_events` |
+| **Root Cause Analysis** | The agent's diagnosis of the underlying failure, drawn from `agent_reasoning` |
+| **Impact Assessment** | Which services, users, or data were affected and for how long |
+| **Remediation Steps Taken** | The exact command executed, who approved it, and the verification outcome |
+| **Lessons Learned / Action Items** | Suggested follow-up tasks to prevent recurrence |
+| **MTTR** | `resolved_at - created_at` formatted as a human-readable duration |
+
+<Tip>
+  For incidents that were resolved manually (e.g., an engineer fixed the issue directly and the agent never ran a command), you can still retrieve a post-mortem by opening the **Post-Mortem** tab and calling `GET /api/incidents/{id}/post-mortem`. If `post_mortem_md` is empty, the endpoint re-generates the document on demand using whatever incident context is available.
+</Tip>
+
+## The PostMortemEditor Component
+
+The `PostMortemEditor` renders only when `incident.status === 'resolved'`. For incidents still in progress it shows a message explaining that the post-mortem will be generated automatically upon resolution.
+
+```tsx
+// Loading state — shown while fetching from the API:
+// "Generating post-mortem..." spinner
+
+// Ready state — the full editable textarea:
+<textarea
+  value={content}
+  onChange={(e) => setContent(e.target.value)}
+  className="... min-h-[520px] font-mono ..."
+/>
+```
+
+The component header displays:
+- **Last updated** — formatted date/time of the most recent save
+- **Character count** — locale-formatted length of the current content
+- **Export .md** button — triggers a browser download of the raw Markdown
+- **Save** button — disabled while loading, while saving, or if the content is empty
+
+## API Reference
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/incidents/{id}/post-mortem` | Fetch the post-mortem. Re-generates if `post_mortem_md` is null. |
+| `PUT` | `/api/incidents/{id}/post-mortem` | Save edited content to `post_mortem_md`. Body: `{ "content": "..." }` |
+
+Both endpoints require a valid Supabase Bearer token in the `Authorization` header. The `PUT` response includes an `updated_at` timestamp that the `PostMortemEditor` uses to refresh the header metadata without a full reload.
+
+## ChromaDB Storage
+
+After a post-mortem is generated, Sentinel stores the full incident record (including `agent_reasoning`, `proposed_action`, and the post-mortem text) in ChromaDB under the `incidents-{domain}` collection. This enables the `SimilarIncidentsCard` to surface this incident when future incidents with similar patterns are investigated — closing the learning loop across incidents.
+
+## Export via ExportModal
+
+The **Export Incident** button (accessible from the detail panel header) opens the `ExportModal`, which includes the complete `post_mortem_md` field in both the JSON and Markdown export formats. This makes it easy to attach post-mortems to tickets, share them in Slack, or archive them in a runbook repository.
+
+```json
+// JSON export excerpt:
+{
+  "post_mortem": "# Post-Mortem: nginx-prod High Error Rate\n\n## Incident Summary\n..."
+}
+```

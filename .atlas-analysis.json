@@ -1,0 +1,113 @@
+{
+  "projectType": "saas",
+  "projectName": "Sentinel SoftServe",
+  "projectDescription": "An agentic AI co-pilot for DevOps incident triage that automates detection, investigation, and resolution of incidents across Docker, Podman, Kubernetes, and PostgreSQL environments with human-in-the-loop approval.",
+  "theme": "aspen",
+  "primaryColor": "#9ca4a4",
+  "lightColor": "#383c40",
+  "darkColor": "#d5d5d6",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Deployment",
+            "pages": [
+              "deployment/docker-compose",
+              "deployment/configuration",
+              "deployment/database-setup",
+              "deployment/runbook-seeding"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/incident-lifecycle",
+              "concepts/multi-agent-pipeline",
+              "concepts/guardrails",
+              "concepts/memory-rag"
+            ]
+          },
+          {
+            "group": "Supported Runtimes",
+            "pages": [
+              "runtimes/docker",
+              "runtimes/podman",
+              "runtimes/kubernetes",
+              "runtimes/postgresql"
+            ]
+          },
+          {
+            "group": "Using the Dashboard",
+            "pages": [
+              "dashboard/overview",
+              "dashboard/incidents",
+              "dashboard/approvals",
+              "dashboard/post-mortem"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "api/overview",
+              "api/authentication"
+            ]
+          },
+          {
+            "group": "Endpoints",
+            "pages": [
+              "api/incidents",
+              "api/actions",
+              "api/alerts",
+              "api/health"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Automatic incident detection via Prometheus Alertmanager webhook",
+    "LangGraph multi-agent pipeline: classification, investigation, decision, action, post-mortem",
+    "Human-in-the-loop action approval before any remediation command is executed",
+    "Specialist agents for Docker, Podman, Kubernetes, and PostgreSQL",
+    "RAG-powered runbook retrieval using ChromaDB vector store",
+    "Episodic memory for similar incident lookup across past incidents",
+    "Deterministic guardrails for prompt injection defense and action whitelisting",
+    "Automated post-mortem generation with LLM and MTTR calculation",
+    "Real-time dashboard updates via Supabase Realtime subscriptions",
+    "Agent observability via LangFuse tracing"
+  ],
+  "publicApiSurface": [
+    "GET /api/incidents",
+    "POST /api/incidents",
+    "GET /api/incidents/{incident_id}",
+    "PATCH /api/incidents/{incident_id}/status",
+    "GET /api/incidents/{incident_id}/post-mortem",
+    "PUT /api/incidents/{incident_id}/post-mortem",
+    "GET /api/incidents/{incident_id}/export",
+    "GET /api/incidents/{incident_id}/runbooks",
+    "GET /api/incidents/{incident_id}/similar",
+    "GET /api/incidents/{incident_id}/metrics",
+    "POST /api/execute-action",
+    "POST /api/incidents/{incident_id}/reject",
+    "POST /api/incidents/{incident_id}/postpone",
+    "POST /api/alerts",
+    "GET /api/health",
+    "GET /health"
+  ]
+}

@@ -1,47 +1,179 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with Sentinel SoftServe"
+sidebarTitle: "Quickstart"
+description: "Run Sentinel locally in under 10 minutes using Docker Compose. Covers cloning, environment setup, database schema, ChromaDB seeding, and your first incident simulation."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+This guide walks you through standing up a fully functional Sentinel instance on your local machine. By the end you will have the entire observability stack, the FastAPI backend, and the React dashboard running together — and you will trigger your first AI-driven incident triage with a single Docker command.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+<Note>
+  Make sure you have Docker Desktop running, Node.js 20+, Python 3.9+, a Supabase project, and an OpenAI API key before you start. See the [Introduction](/introduction) for the full prerequisites list.
+</Note>
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+
+  <Step title="Clone the repository">
+    Pull the source code and enter the project directory.
 
     ```bash
-    npm install your-package
+    git clone https://github.com/nicolas344/Sentinel-SoftServe.git
+    cd Sentinel-SoftServe
     ```
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+
+  <Step title="Configure environment variables">
+    Sentinel needs two `.env` files — one for the backend and one for the frontend. Create both before starting any services.
+
+    **Backend** — create `Backend/.env`:
+
+    ```env
+    SUPABASE_URL=https://your-project.supabase.co
+    SUPABASE_SERVICE_KEY=your-service-role-key
+    SUPABASE_JWT_SECRET=your-jwt-secret
+
+    OPENAI_API_KEY=sk-...
+    OPENAI_MODEL=gpt-4o-mini
+
+    LANGFUSE_PUBLIC_KEY=pk-lf-...
+    LANGFUSE_SECRET_KEY=sk-lf-...
+    LANGFUSE_HOST=http://localhost:3001
+
+    LOKI_URL=http://localhost:3100
+    CHROMA_HOST=http://localhost:8001
+    PROMETHEUS_URL=http://localhost:9090
+
+    # Shared secret for the /api/alerts webhook.
+    # Must match http_config.authorization.credentials in alertmanager/alertmanager.yml.
+    # Omit only in development — leaves the webhook open.
+    ALERT_WEBHOOK_SECRET=sentinel-webhook-secret-change-me
+
+    # Optional: comma-separated allowed CORS origins.
+    # Production example: CORS_ORIGINS=https://sentinel-softserve-1.onrender.com
+    # CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+    ```
+
+    **Frontend** — create `Frontend/.env.local`:
+
+    ```env
+    VITE_SUPABASE_URL=https://your-project.supabase.co
+    VITE_SUPABASE_ANON_KEY=your-anon-key
+    VITE_API_URL=http://localhost:8000
+    ```
+  </Step>
+
+  <Step title="Apply the database schema">
+    The Supabase schema lives in `supabase/migrations/`. For a **brand-new** Supabase project, open the SQL Editor in the Supabase dashboard and run each migration file in order:
+
+    ```
+    supabase/migrations/0001_initial_schema.sql
+    supabase/migrations/0002_production_hardening.sql
+    ```
+
+    <Note>
+      If you are joining an existing team project that already has the baseline schema, only apply `0002_production_hardening.sql`. Alternatively, use `supabase db push` from the Supabase CLI if your environment is configured.
+    </Note>
+  </Step>
+
+  <Step title="Start the infrastructure stack">
+    Docker Compose starts Prometheus, Alertmanager, Loki, Promtail, Grafana, LangFuse, and ChromaDB in the background with a single command.
 
     ```bash
-    your-cli init
+    docker compose up -d
     ```
+
+    Wait about 30 seconds for all containers to become healthy before proceeding.
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+
+  <Step title="Install backend dependencies">
+    Create a Python virtual environment and install the FastAPI application's requirements.
 
     ```bash
-    your-cli start
+    cd Backend
+    python3 -m venv env
+    source env/bin/activate      # Windows: env\Scripts\activate
+    pip install -r requirements.txt
     ```
   </Step>
+
+  <Step title="Seed ChromaDB with runbooks (one-time only)">
+    Sentinel's RAG pipeline needs runbook documents loaded into ChromaDB before the agent can retrieve relevant remediation context. Run each seed script once with your virtual environment active.
+
+    ```bash
+    cd Backend
+    source env/bin/activate
+
+    python scripts/seed_chromadb.py            # Docker runbooks
+    python scripts/seed_postgres_runbooks.py   # PostgreSQL runbooks
+    python scripts/seed_podman_runbooks.py     # Podman runbooks
+    python scripts/seed_kubernetes_runbooks.py # Kubernetes runbooks
+    ```
+
+    Each script populates a dedicated `runbooks-{domain}` collection in ChromaDB. You only need to run these once; re-running them on an existing instance will upsert without duplication.
+  </Step>
+
+  <Step title="Start the backend">
+    Launch the FastAPI application with hot-reload enabled. Keep this terminal open.
+
+    ```bash
+    cd Backend
+    source env/bin/activate
+    uvicorn main:app --reload --host 0.0.0.0
+    ```
+
+    The backend is ready at **http://localhost:8000**. Interactive Swagger docs are at **http://localhost:8000/docs**.
+  </Step>
+
+  <Step title="Start the frontend">
+    In a new terminal, install Node dependencies and start the Vite dev server.
+
+    ```bash
+    cd Frontend
+    npm install   # first time only
+    npm run dev
+    ```
+
+    The React dashboard opens at **http://localhost:5173**. Sign in with the Supabase email and password you configured for your project.
+  </Step>
+
+  <Step title="Simulate your first incident">
+    With everything running, trigger a realistic container crash to watch Sentinel's full triage pipeline in action.
+
+    ```bash
+    docker run -d --name demo-crash alpine sh -c "
+      echo '[INFO] Starting service on port 8080'
+      echo '[INFO] Connecting to postgres://db:5432...'
+      sleep 5
+      echo '[ERROR] Connection pool exhausted after 3 retries'
+      sleep 5
+      echo '[FATAL] Could not recover connection. Shutting down.'
+      exit 1
+    "
+    ```
+
+    <Note>
+      Sentinel will automatically detect the crash within **20–30 seconds**. It will fetch the container logs from Loki, classify the incident type with GPT-4o-mini, route to the DockerAgent for investigation, and surface a proposed corrective action in the dashboard for your approval.
+    </Note>
+
+    Once the incident appears in the dashboard you can:
+    - Read the agent's full reasoning and tool call history in the **Agent Reasoning** panel.
+    - **Approve** the proposed action (e.g. `docker restart demo-crash`) to trigger Lab 4 — Action & Verification.
+    - **Reject** or **Postpone** if you want to handle remediation manually.
+    - After resolution, generate a **Post-Mortem** report directly from the incident detail view.
+  </Step>
+
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Service URLs
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>
+Once the full stack is running, all services are accessible at the following local addresses.
+
+| Service | URL | Credentials |
+|---|---|---|
+| Sentinel Dashboard | http://localhost:5173 | Supabase email/password |
+| Backend API | http://localhost:8000 | — |
+| API Docs (Swagger) | http://localhost:8000/docs | — |
+| Grafana | http://localhost:3000 | admin / sentinel123 |
+| Prometheus | http://localhost:9090 | — |
+| Alertmanager | http://localhost:9093 | — |
+| LangFuse | http://localhost:3001 | local account |
+| ChromaDB | http://localhost:8001 | — |

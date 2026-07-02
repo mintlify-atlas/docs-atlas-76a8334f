@@ -1,0 +1,106 @@
+---
+title: "Sentinel Dashboard: Real-Time Incident Management Interface"
+sidebarTitle: "Overview"
+description: "Tour of the Sentinel React dashboard — live incident feed, agent reasoning panel, metrics, timelines, command palette, and export capabilities powered by Supabase Realtime."
+---
+
+The Sentinel dashboard is the primary interface for managing DevOps incidents in real time. Built with React and backed by Supabase Realtime, it presents a live feed of all incidents, the LangGraph agent's full reasoning chain, Prometheus metrics, runbook recommendations, and a suite of tools for approving remediations and generating post-mortems — all without a page refresh.
+
+## Authentication
+
+Sentinel uses email and password authentication via Supabase. Navigate to `/login` to sign in. The `AuthContext` stores the active Supabase session and exposes `user`, `signIn`, `signUp`, and `signOut` to all child components. After a successful sign-in the app redirects to the main dashboard at `/`.
+
+```tsx
+// AuthContext exposes:
+const { user, loading, signIn, signOut } = useAuth()
+```
+
+Every API call to the FastAPI backend attaches the Supabase JWT as a Bearer token so the server can verify identity and record `approved_by` on approval actions.
+
+## Dashboard Layout
+
+The dashboard is a three-column, full-viewport layout:
+
+| Column | Width | Purpose |
+|---|---|---|
+| **Incident list** (Col 1) | 288 px | Scrollable, filterable list of all incidents |
+| **Incident core detail** (Col 2) | Flexible | Proposed command, execution state, stdout/stderr |
+| **Context panel** (Col 3) | 384 px | Tabbed: Agent reasoning, Metrics, Runbooks, Timeline, Post-mortem |
+
+When no incident is selected, Col 2 and Col 3 show a welcome state with a button to create a test incident. The header bar spans the full width and contains the brand logo, a search trigger, notification controls, a link to the `/setup` system-health page, the current user's email initial, and a sign-out button.
+
+## Real-Time Updates
+
+The dashboard subscribes to the Supabase `incidents` table via Postgres Changes as soon as it mounts:
+
+```js
+const channel = supabase
+  .channel('incidents-realtime')
+  .on(
+    'postgres_changes',
+    { event: '*', schema: 'public', table: 'incidents' },
+    (payload) => {
+      if (payload.eventType === 'INSERT') { /* prepend */ }
+      if (payload.eventType === 'UPDATE') { /* merge patch */ }
+      if (payload.eventType === 'DELETE') { /* remove + deselect */ }
+    }
+  )
+  .subscribe()
+```
+
+INSERT events also trigger browser push notifications (if permission is granted). A **Snooze** button silences notifications for 15 minutes without affecting the real-time data stream.
+
+## UI Components
+
+<CardGroup cols={2}>
+  <Card title="IncidentCard" icon="rectangle-list">
+    Renders each incident in the left-hand list. Shows a color-coded severity border and dot, the truncated title, target name (monospace), runtime badge, relative timestamp, severity badge, and status label. Critical incidents pulse continuously. Incidents awaiting approval display an animated **Approve** chip.
+  </Card>
+  <Card title="AgentReasoningPanel" icon="robot">
+    Parses the `agent_reasoning` Markdown field and renders it as a structured UI: an agent identity header (Docker / Kubernetes / Postgres / Podman), a tool-invocation chip list, a similar-incidents count, and each analysis section (root cause, evidence, recommended actions, urgency) in its own color-accented card. While the LLM is still writing, a live skeleton + animated pipeline steps are shown instead.
+  </Card>
+  <Card title="ApprovalBanner" icon="circle-check">
+    Appears at the top of the detail pane when `status === 'awaiting_approval'`. Displays the proposed shell command in a monospace block and provides three action buttons: **Approve & Execute**, **Reject**, and **Postpone 30 min**.
+  </Card>
+  <Card title="MetricsPanel" icon="chart-bar">
+    Fetches live Prometheus data from `GET /api/incidents/{id}/metrics`. For container incidents it shows memory usage (MB + %), CPU %, network in/out (KB/s), and restart count in the last hour. For PostgreSQL incidents it shows connection count, database size, cache hit ratio, deadlocks per minute, and longest running transaction. Falls back to a historical `metrics_snapshot` stored at detection time if Prometheus is unavailable.
+  </Card>
+  <Card title="IncidentTimeline" icon="timeline">
+    Reads the `incident_events` table (keyed by `status` and `occurred_at`) and builds a chronological event list: Detected → Classifying → Investigated → Awaiting Approval → Action Executed → Verifying → Resolved/Failed. Each step shows its timestamp and a description (tools used, proposed command, error reason).
+  </Card>
+  <Card title="RunbookViewer" icon="book-open">
+    Queries `GET /api/incidents/{id}/runbooks` to fetch the top ChromaDB-matched runbooks for the incident. Renders each runbook's sections (TYPE, SIGNALS, CAUSE, STEPS, NOTES) with color-coded headings and supports in-panel search to re-query with a custom term.
+  </Card>
+  <Card title="SimilarIncidentsCard" icon="copy">
+    Calls `GET /api/incidents/{id}/similar` to retrieve past incidents with semantically similar patterns from ChromaDB memory. Displays the prior incident's title, severity, type, target, tools used, and how long ago it occurred.
+  </Card>
+  <Card title="CommandPalette" icon="keyboard">
+    A `⌘K` (or `Ctrl+K`) overlay for keyboard-first navigation. Filters the full incident list in real time and also offers quick actions: **New Incident** and **System Status**. Supports arrow-key navigation and `Enter` to open an incident or execute an action.
+  </Card>
+  <Card title="CreateIncidentModal" icon="plus">
+    A modal form for manually creating incidents. Required fields: Title (max 200 chars) and Target (max 100 chars). Optional: Severity (critical / high / medium / low), Source type (container / database / manual), and a freeform Description/Context field (max 5,000 chars). On submit, the LangGraph pipeline starts automatically in the background. Press `Escape` to dismiss.
+  </Card>
+  <Card title="ExportModal" icon="download">
+    Triggered by the **Export Incident** button in the detail header. Offers two formats: **JSON** (full structured export with metadata, evidence, timeline, decisions, actions, and post-mortem) and **Markdown** (human-readable report). Both formats are fetched from `GET /api/incidents/{id}/export?format=<json|markdown>` and immediately downloaded to disk.
+  </Card>
+</CardGroup>
+
+## Context Panel Tabs
+
+When an incident is selected, the right-hand panel provides five tabs:
+
+| Tab | Component | Description |
+|---|---|---|
+| **Agent** | `AgentReasoningPanel` | Full LLM analysis with structured sections |
+| **Metrics** | `MetricsPanel` | Live Prometheus data + container logs |
+| **Runbooks** | `RunbookViewer` + `SimilarIncidentsCard` | ChromaDB runbooks and past similar incidents |
+| **Timeline** | `IncidentTimeline` | Chronological status transitions with exact timestamps |
+| **Post-Mortem** | `PostMortemEditor` | Auto-generated report, editable and exportable |
+
+## System Health Page
+
+The `/setup` page (accessible from the **System** link in the header) shows:
+- **Integrations** tab — live health check of Prometheus, Loki, ChromaDB, Alertmanager, LangFuse, and Supabase, refreshed every 30 seconds.
+- **Agent Labs** tab — a visual breakdown of the five LangGraph pipeline stages each incident passes through.
+- **Metrics** tab — aggregate stats: total incidents processed, resolution rate, average MTTR, incidents by severity, and most frequent incident type.
+- **Getting Started** tab — step-by-step setup guide.

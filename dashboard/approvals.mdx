@@ -1,0 +1,133 @@
+---
+title: "Approving and Rejecting Agent-Proposed Actions in Sentinel"
+sidebarTitle: "Approvals"
+description: "How Sentinel's human-in-the-loop approval flow works: reviewing the agent's reasoning and proposed action, then approving, rejecting, or postponing remediation."
+---
+
+Sentinel is designed around a human-in-the-loop model: the LangGraph agent investigates an incident and proposes a remediation command, but **an engineer must explicitly approve it** before any mutation occurs in the production environment. This page explains how the `ApprovalBanner` works, what each decision means, and what happens to the incident after you act.
+
+## When Approval Is Required
+
+After the agent completes its investigation (status `analyzed`), the Supervisor node validates the proposed action against the command whitelist and updates the incident to `awaiting_approval`, storing the command in the `proposed_action` field. At this point:
+
+1. The incident card in the left-hand list shows an animated cyan **⚡ Approve** chip.
+2. The `ApprovalBanner` component renders at the top of the incident detail pane (Col 2).
+3. The Context Panel remains fully accessible — the **Agent**, **Metrics**, **Runbooks**, and **Timeline** tabs are all readable so you can review everything before deciding.
+
+## The ApprovalBanner
+
+The banner has three sections:
+
+- **Header stripe** — labeled "Agent-Proposed Action" in cyan.
+- **Command block** — the exact shell command the agent wants to run, displayed in a monospace `pre` block with sky-blue text (e.g., `docker restart my-container` or `kubectl rollout restart deployment/api -n production`).
+- **Action buttons** — Reject (red), Postpone 30 min (gray), and Approve & Execute (green).
+
+The banner only renders when `incident.proposed_action` is set and `status === 'awaiting_approval'`. If either condition is false, the component returns `null`.
+
+## The Three Decisions
+
+<Steps>
+  <Step title="Review the proposed action">
+    Read the command in the banner. Cross-reference it with:
+    - The **Agent tab** → the full `agent_reasoning` Markdown explaining the root cause and why this specific command was chosen.
+    - The **Metrics tab** → current CPU, memory, connections, or restart count to confirm the resource is still in the expected degraded state.
+    - The **Timeline tab** → the chronological steps the agent took to reach this conclusion.
+  </Step>
+  <Step title="Approve — execute the command">
+    Click **Approve & Execute**. This calls `POST /api/execute-action` with `incident_id` and `command` in the request body, authenticated with your Supabase JWT.
+
+    ```js
+    POST /api/execute-action
+    Authorization: Bearer <jwt>
+
+    { "incident_id": "abc123", "command": "docker restart my-container" }
+    ```
+
+    The API performs a database-level atomic claim (`UPDATE WHERE status='awaiting_approval'`) before executing. If another engineer claimed the incident a split-second earlier, the API returns **HTTP 409 Conflict** and the banner displays an error. This prevents double-execution.
+
+    On success the status transitions through:
+    `awaiting_approval` → `executing_solution` → `verifying` → `resolved` (or `failed`)
+
+    The `approved_by` field is recorded with the engineer's identity (email or JWT `sub`).
+  </Step>
+  <Step title="Reject — mark as failed">
+    Click **Reject** if the proposed action is incorrect, unsafe, or the incident has already been handled manually. This calls `POST /api/incidents/{id}/reject`.
+
+    The incident status moves to `failed`. The `action_error` field is prefixed with `[RECHAZADO]` followed by any optional comment you provide. No command is executed.
+  </Step>
+  <Step title="Postpone — return to analyzed">
+    Click **Postpone 30 min** if the timing is wrong (e.g., the target is in a maintenance window) or if more investigation is needed. This calls `POST /api/incidents/{id}/postpone`.
+
+    The status reverts to `analyzed`. The `action_error` field is prefixed with `[POSPUESTO]`. The incident remains in the list and the `proposed_action` is preserved, so you can re-approve later.
+  </Step>
+</Steps>
+
+## Whitelisted Commands
+
+The agent is only permitted to propose commands from a strict server-side whitelist. Any command outside this list is rejected at the planning stage and never shown in the `ApprovalBanner`.
+
+| Runtime | Allowed Commands |
+|---|---|
+| Docker | `docker restart <container>`, `docker logs <container>` |
+| Podman | `podman restart <container>`, `podman logs <container>` |
+| Kubernetes | `kubectl rollout restart deployment/<name> -n <namespace>`, `kubectl delete pod <name> -n <namespace>`, `kubectl scale deployment/<name> --replicas=N -n <namespace>` |
+| PostgreSQL | `pg_stat_activity <db>`, `pg_cancel_backend <db>`, `pg_terminate_backend <db>` |
+
+<Warning>
+  The `pg_terminate_backend` command terminates **all active connections** to the target database. This is appropriate for connection-exhaustion incidents but will interrupt any in-flight transactions. Verify the impact on active workloads before approving this action.
+</Warning>
+
+## What Happens After Approval
+
+Once you approve, the backend executes the command via the appropriate runtime adapter:
+
+<Tabs>
+  <Tab title="Docker / Podman">
+    The command runs as a subprocess call on the host where the Sentinel backend is deployed. The `stdout` is stored in `action_result` and the `stderr` in `action_error`. After execution, the verification service inspects the container state to confirm it returned to `running`.
+
+    ```bash
+    # Example — what Sentinel executes server-side:
+    docker restart my-container
+    ```
+  </Tab>
+  <Tab title="Kubernetes">
+    `kubectl` is invoked as a subprocess. If `K8S_PROXY_URL` is configured in the environment, the kubeconfig is set to proxy through that URL. `stdout` and `stderr` are captured the same way as Docker actions.
+
+    ```bash
+    # Example:
+    kubectl rollout restart deployment/api -n production
+    ```
+  </Tab>
+  <Tab title="PostgreSQL">
+    The psycopg2 driver executes the function directly against the target database using the `DB_DSN` connection string from the environment. No shell subprocess is involved.
+
+    ```sql
+    -- Example:
+    SELECT pg_terminate_backend(pid)
+    FROM pg_stat_activity
+    WHERE datname = 'app-db' AND pid <> pg_backend_pid();
+    ```
+  </Tab>
+</Tabs>
+
+## Atomic Claim Mechanism
+
+To prevent two engineers from approving the same incident simultaneously, the backend executes an atomic `UPDATE` that transitions the row from `awaiting_approval` to `executing_solution` only if no other process has already claimed it:
+
+```sql
+UPDATE incidents
+SET status = 'executing_solution', approved_by = $1
+WHERE id = $2 AND status = 'awaiting_approval'
+RETURNING id;
+```
+
+If `RETURNING` yields zero rows, the API responds with `HTTP 409 Conflict`. The dashboard displays this as an error in the `ApprovalBanner` so the second engineer knows the action was already taken.
+
+## Post-Execution States
+
+| Final status | Meaning |
+|---|---|
+| `resolved` | The verification service confirmed the resource returned to a healthy state |
+| `failed` | The command ran but verification showed the resource is still unhealthy, or the command itself exited with a non-zero code |
+| `failed` (after Reject) | An engineer explicitly rejected the action — `action_error` begins with `[RECHAZADO]` |
+| `analyzed` (after Postpone) | An engineer postponed the action — `action_error` begins with `[POSPUESTO]` |

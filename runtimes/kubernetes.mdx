@@ -1,0 +1,240 @@
+---
+title: "Kubernetes Runtime: Pod and Deployment Incident Triage"
+sidebarTitle: "Kubernetes"
+description: "Sentinel's KubernetesAgent uses the official Python Kubernetes SDK to investigate pod failures, CrashLoopBackOff, OOMKills, and deployment issues with six read-only tools."
+---
+
+The **KubernetesAgent** investigates Kubernetes workload incidents using the official Python `kubernetes` SDK. It supports the full range of pod failure modes — `CrashLoopBackOff`, `OOMKilled`, `ImagePullBackOff`, `Pending` due to resource constraints, and deployment replica mismatches — through six read-only tools that query the cluster's API server without modifying any state.
+
+## Runtime Detection
+
+The KubernetesAgent activates when either of the following is true:
+
+1. The alert label `container_runtime=kubernetes` is set.
+2. The `target` field starts with `pod/` or `deployment/` — regardless of runtime labels.
+
+```python
+# services/agents/kubernetes/agent.py — KubernetesAgent.matches()
+def matches(self, ctx: IncidentContext) -> bool:
+    source = (ctx.labels.get("source_type") or "").lower()
+    if source == "database":
+        return False
+    runtime = (ctx.labels.get("container_runtime") or "").lower()
+    if runtime == "kubernetes":
+        return True
+    target = (ctx.target or "").lower()
+    return target.startswith("pod/") or target.startswith("deployment/")
+```
+
+### Target Format
+
+Kubernetes incidents must use a prefixed target that identifies both the resource type and the name:
+
+| Resource | Target format | Example |
+|----------|---------------|---------|
+| Pod | `pod/<name>` | `pod/crash-test` |
+| Deployment | `deployment/<name>` | `deployment/api-server` |
+
+The namespace is read from the alert label `namespace` (defaults to `default`).
+
+## Kubeconfig Loading
+
+The tools initialize the Kubernetes SDK once and cache the result. The loading order mirrors standard `kubectl` behavior:
+
+<Steps>
+  <Step title="K8S_PROXY_URL (highest priority)">
+    If `K8S_PROXY_URL` is set, the SDK connects to that HTTP endpoint directly with TLS verification disabled. This is the recommended approach for Docker Desktop environments where `127.0.0.1:6443` is not reachable from inside the backend container.
+
+    ```bash
+    # Start the proxy on your LAN IP before running Sentinel
+    kubectl proxy --port=8555 --address=<LAN_IP> --accept-hosts='.*' &
+    ```
+
+    Then set in `docker-compose.yml`:
+
+    ```yaml
+    environment:
+      K8S_PROXY_URL: "http://192.168.1.42:8555"
+    ```
+  </Step>
+  <Step title="In-cluster config">
+    When the backend runs as a pod inside the cluster, the SDK picks up the service account token and CA bundle automatically via `load_incluster_config()`.
+  </Step>
+  <Step title="KUBECONFIG / ~/.kube/config">
+    Falls back to the standard kubeconfig file — either from the `KUBECONFIG` environment variable or `~/.kube/config`. This is the typical path for production deployments where the backend runs on a node with cluster credentials.
+  </Step>
+</Steps>
+
+<Note>
+  Docker Desktop on macOS/Windows runs Kubernetes inside a VM. The API server listens on `127.0.0.1:6443` inside the VM, which is not the same `127.0.0.1` that Sentinel's backend container sees. Run `kubectl proxy` on the **LAN IP** of your machine (not `localhost`) and set `K8S_PROXY_URL` to that address. The `--accept-hosts='.*'` flag is required so the proxy accepts connections from outside `localhost`.
+</Note>
+
+## Tools
+
+All six tools are **read-only** and use the `CoreV1Api` and `AppsV1Api` clients from the official Kubernetes Python SDK. They never create, patch, or delete any cluster resource.
+
+<CardGroup cols={2}>
+  <Card title="get_pod_status" icon="circle-info">
+    Pod phase (`Running`/`Pending`/`Failed`), container states (including `CrashLoopBackOff`, `OOMKilled`, `ImagePullBackOff`), restart count per container, assigned node, and pod IP. **Start here for any pod incident.**
+  </Card>
+  <Card title="describe_pod" icon="file-magnifying-glass">
+    Full pod spec: CPU/memory requests and limits, liveness and readiness probe configuration, volume names, init containers, environment variable count, service account, and node selector.
+  </Card>
+  <Card title="get_pod_logs" icon="file-lines">
+    Last N lines of pod logs (default 100, max 500). Automatically falls back to `previous=True` when the current container is not running — essential for `CrashLoopBackOff` diagnosis.
+  </Card>
+  <Card title="get_pod_events" icon="bell">
+    Kubernetes events for a specific pod, sorted by `last_timestamp` descending (up to 20). Captures `OOMKill`, `BackOff`, `FailedMount`, `FailedScheduling`, and `Pulling`/`Failed` image events.
+  </Card>
+  <Card title="get_deployment_status" icon="layer-group">
+    Desired, ready, available, and updated replica counts; update strategy type; deployment conditions (`Available`, `Progressing`); and pod selector labels. Use for replica mismatch or stuck rollout incidents.
+  </Card>
+  <Card title="list_failing_pods" icon="triangle-exclamation">
+    All pods in the namespace that are not `Running` or `Succeeded`. Includes phase, problem description (`CrashLoopBackOff`, `ImagePullBackOff`, `NotReady`), total restart count, and assigned node.
+  </Card>
+</CardGroup>
+
+### Tool Parameters
+
+| Tool | Parameter | Type | Default | Description |
+|------|-----------|------|---------|-------------|
+| `get_pod_status` | `pod_name` | `string` | — | Pod name |
+| `get_pod_status` | `namespace` | `string` | `"default"` | Kubernetes namespace |
+| `describe_pod` | `pod_name` | `string` | — | Pod name |
+| `describe_pod` | `namespace` | `string` | `"default"` | Kubernetes namespace |
+| `get_pod_logs` | `pod_name` | `string` | — | Pod name |
+| `get_pod_logs` | `namespace` | `string` | `"default"` | Kubernetes namespace |
+| `get_pod_logs` | `tail` | `integer` | `100` | Lines to return (max 500) |
+| `get_pod_events` | `pod_name` | `string` | — | Pod name |
+| `get_pod_events` | `namespace` | `string` | `"default"` | Kubernetes namespace |
+| `get_deployment_status` | `deployment_name` | `string` | — | Deployment name |
+| `get_deployment_status` | `namespace` | `string` | `"default"` | Kubernetes namespace |
+| `list_failing_pods` | `namespace` | `string` | `"default"` | Namespace to inspect |
+
+## Failure Modes the Agent Recognizes
+
+The KubernetesAgent's system prompt trains it to diagnose the following Kubernetes-specific failure patterns:
+
+<CardGroup cols={2}>
+  <Card title="CrashLoopBackOff" icon="arrows-rotate">
+    `state.waiting.reason = "CrashLoopBackOff"`, high restart count, non-zero exit code. Caused by bad config, missing env vars, immediate OOMKill, or aggressive liveness probes.
+  </Card>
+  <Card title="OOMKilled" icon="memory">
+    `state.terminated.reason = "OOMKilled"`, exit code 137. Memory limit too low or application memory leak. Remediation: increase limit or investigate heap.
+  </Card>
+  <Card title="ImagePullBackOff" icon="image">
+    `state.waiting.reason = "ImagePullBackOff"` or `"ErrImagePull"`. Missing tag, wrong registry, expired `ImagePullSecret`, or network/DNS issue.
+  </Card>
+  <Card title="Pending — Unschedulable" icon="clock">
+    `phase = "Pending"` with events listing `Insufficient cpu/memory`, `Unschedulable`, unmatched `nodeSelector`, or missing toleration for a taint.
+  </Card>
+  <Card title="Pod NotReady" icon="circle-xmark">
+    `conditions[Ready].status = "False"` while the pod is Running. Application still starting, readiness probe too strict, or external dependency unavailable.
+  </Card>
+  <Card title="Replica Mismatch" icon="layer-group">
+    `ready_replicas < spec.replicas`. Caused by pods in CrashLoopBackOff, node unavailability, or a blocking `PodDisruptionBudget`.
+  </Card>
+</CardGroup>
+
+## Action Proposals
+
+The Supervisor's `_build_proposed_action` function maps resource type and incident type to one of three whitelisted `kubectl` commands. All commands require human approval before execution.
+
+<Tabs>
+  <Tab title="Pod incidents">
+    For `pod/<name>` targets with a crashy incident type, the agent proposes a pod deletion (Kubernetes recreates it from the ReplicaSet):
+
+    | Incident type | Proposed action |
+    |---------------|-----------------|
+    | `app_crash` | `kubectl delete pod <name> -n <namespace>` |
+    | `oom` | `kubectl delete pod <name> -n <namespace>` |
+    | `restart_loop` | `kubectl delete pod <name> -n <namespace>` |
+    | `dependency_failure` | `kubectl delete pod <name> -n <namespace>` |
+    | `config_error` | `kubectl delete pod <name> -n <namespace>` |
+  </Tab>
+  <Tab title="Deployment incidents">
+    For `deployment/<name>` targets, a rolling restart is proposed regardless of incident type:
+
+    | Target type | Proposed action |
+    |-------------|-----------------|
+    | Any deployment | `kubectl rollout restart deployment/<name> -n <namespace>` |
+  </Tab>
+  <Tab title="Scale action">
+    In cases where the deployment should be scaled (e.g. scaling down a broken rollout), the action executor also accepts:
+
+    ```bash
+    kubectl scale deployment/<name> --replicas=<0-10> -n <namespace>
+    ```
+
+    This must be the exact proposed action value — the allowlist enforces `--replicas` between 0 and 10.
+  </Tab>
+</Tabs>
+
+The action executor in `routers/actions.py` validates commands with `_validate_kubernetes_command`, which rejects any token containing shell metacharacters (`;`, `&&`, `|`, `` ` ``, `$(`, `>`, `<`, `\n`) and enforces RFC 1123 name patterns via `^[a-z0-9][a-z0-9\-.]{0,251}[a-z0-9]$`.
+
+## Simulating an Incident
+
+The `demo_kubernetes.sh.example` script automates the full simulation. Here is the core sequence:
+
+<Steps>
+  <Step title="Deploy a pod that crashes in a loop">
+    ```bash
+    kubectl run crash-test \
+      --image=busybox:latest \
+      --restart=Always \
+      --namespace=default \
+      -- /bin/sh -c "echo 'sentinel kubernetes crash test'; sleep 2; exit 1"
+
+    # Wait for CrashLoopBackOff
+    sleep 15
+    kubectl get pod crash-test -n default
+    ```
+
+    After ~15 seconds you should see something like:
+
+    ```
+    NAME         READY   STATUS             RESTARTS   AGE
+    crash-test   0/1     CrashLoopBackOff   3          40s
+    ```
+  </Step>
+  <Step title="Send the Alertmanager-format payload">
+    ```bash
+    RESTARTS=$(kubectl get pod crash-test -n default --no-headers | awk '{print $4}')
+
+    curl -s -X POST http://localhost:8000/api/alerts \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $TOKEN" \
+      -d '{
+        "status": "firing",
+        "alerts": [{
+          "status": "firing",
+          "labels": {
+            "alertname": "KubePodCrashLoopBackOff",
+            "severity": "critical",
+            "name": "crash-test",
+            "pod": "crash-test",
+            "namespace": "default",
+            "container": "crash-test",
+            "container_runtime": "kubernetes",
+            "source_type": "container"
+          },
+          "annotations": {
+            "summary": "CrashLoopBackOff: crash-test (default)",
+            "description": "Container crash-test is in CrashLoopBackOff. Restarts: '"$RESTARTS"'. Process exits with code 1 continuously."
+          },
+          "startsAt": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"
+        }]
+      }'
+    ```
+  </Step>
+  <Step title="Review the analysis">
+    The KubernetesAgent calls `get_pod_status`, `get_pod_events`, and `get_pod_logs` in sequence. It identifies `CrashLoopBackOff`, the non-zero exit code, and the restart count. The proposed action will be `kubectl delete pod crash-test -n default`.
+  </Step>
+  <Step title="Approve and clean up">
+    Approve the action in the Sentinel dashboard (`http://localhost:5173`). After resolution:
+
+    ```bash
+    kubectl delete pod crash-test --ignore-not-found=true --grace-period=0
+    ```
+  </Step>
+</Steps>

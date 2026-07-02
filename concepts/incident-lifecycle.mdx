@@ -1,0 +1,134 @@
+---
+title: "Incident Lifecycle in Sentinel: From Alert to Post-Mortem"
+sidebarTitle: "Incident Lifecycle"
+description: "Walk through every status transition an incident goes through in Sentinel: detected, investigating, analyzed, awaiting_approval, executing_solution, verifying, resolved, and failed."
+---
+
+Every incident in Sentinel moves through a well-defined sequence of statuses, from the moment an alert arrives to the final post-mortem stored in memory. Each transition is driven by real system events — a classification completing, an engineer approving an action, a verification check passing — and every step is written to the `incident_events` table with a precise timestamp so you always have a full audit trail.
+
+## Status Flow
+
+The eight statuses form a directed graph. The happy path ends at `resolved`; any unrecoverable failure lands at `failed`.
+
+```
+detected
+   │
+   ▼
+investigating        ← supervisor begins classification (Lab 1)
+   │
+   ▼
+analyzed             ← investigation complete; reasoning stored
+   │
+   ├──(no action proposed)──────────────────────────────► (terminal: stays analyzed)
+   │
+   ▼
+awaiting_approval    ← safe whitelisted action is ready for engineer review
+   │
+   ▼
+executing_solution   ← engineer approves; atomic DB claim prevents double-execution
+   │
+   ▼
+verifying            ← post-execution health check running
+   │
+   ├──(healthy)──► resolved  ← post-mortem generated & stored in ChromaDB
+   │
+   └──(unhealthy/error)──► failed
+```
+
+## Status Reference
+
+| Status | Trigger | Valid Next States |
+|---|---|---|
+| `detected` | Incident created via alert webhook or manual dashboard entry | `investigating`, `failed` |
+| `investigating` | Supervisor starts — classification LLM call completes, `incident_type` written to DB | `analyzed`, `failed` |
+| `analyzed` | Agent investigation finishes; full `agent_reasoning` markdown persisted | `awaiting_approval`, `failed` |
+| `awaiting_approval` | A safe whitelisted `proposed_action` passed all guardrails | `executing_solution`, `failed` |
+| `executing_solution` | Engineer clicks **Approve**; action claimed atomically in DB | `verifying`, `failed` |
+| `verifying` | Execution succeeded; health verification is running | `resolved`, `failed` |
+| `resolved` | Verification confirms recovery; post-mortem auto-generated | — (terminal) |
+| `failed` | Any unhandled exception, guardrail hard-block, or failed verification | — (terminal) |
+
+<Note>
+The REST API accepts `status=active` as a filter alias. It expands to all non-terminal statuses: `detected`, `investigating`, `analyzed`, `awaiting_approval`, `executing_solution`, and `verifying`. Use it to fetch the live triage queue without listing every intermediate state.
+</Note>
+
+## Event Sourcing with `incident_events`
+
+Every status transition appends a row to the `incident_events` table. The schema captures `incident_id`, `status`, and a UTC `created_at` timestamp. This gives you:
+
+- **MTTR calculation** — subtract `detected` timestamp from `resolved` timestamp
+- **Bottleneck analysis** — find how long incidents spend in `awaiting_approval`
+- **Audit trail** — immutable log that cannot be overwritten, even if the incident row is updated
+
+The supervisor calls `record_event(incident_id, status)` after every `UPDATE` to the `incidents` table, so the events log always lags the status by milliseconds at most.
+
+## Incident Metadata
+
+### Source Types
+
+| `source_type` | Description |
+|---|---|
+| `container` | Alert originates from a running container (Docker, Podman, or Kubernetes workload) |
+| `database` | Alert originates from a PostgreSQL instance |
+| `manual` | Engineer created the incident directly from the dashboard |
+
+### Container Runtimes
+
+When `source_type` is `container`, the `container_runtime` field determines which specialist agent handles triage:
+
+| `container_runtime` | Agent |
+|---|---|
+| `docker` | DockerAgent |
+| `podman` | PodmanAgent |
+| `kubernetes` | KubernetesAgent |
+
+### Severity Levels
+
+| Severity | Typical Use |
+|---|---|
+| `critical` | Service completely down, data loss risk |
+| `high` | Severe degradation, SLA breach imminent |
+| `medium` | Partial failure, impact contained |
+| `low` | Warning-level signal, no immediate user impact |
+
+### Incident Types
+
+The classification model maps every incident into one of ten canonical types. These are the only values the frontend and guardrails accept:
+
+| `incident_type` | Description |
+|---|---|
+| `app_crash` | Process exited unexpectedly |
+| `oom` | Container or process killed by OOM killer |
+| `config_error` | Misconfiguration detected in env vars, mounts, or init |
+| `dependency_failure` | Upstream service or database unreachable |
+| `memory_pressure` | High memory utilization approaching limits |
+| `cpu_throttling` | CPU quota exceeded; process being throttled |
+| `restart_loop` | Container restarting repeatedly (CrashLoopBackOff equivalent) |
+| `network_error` | DNS failure, port unreachable, or timeout |
+| `disk_pressure` | Node or volume approaching capacity |
+| `unknown` | Classifier could not determine type, or guardrail forced fallback |
+
+## Manual Incident Creation
+
+Incidents with `source_type: manual` can be created directly from the Sentinel dashboard. Fill in the title, target, severity, and optionally paste logs. The incident enters at `detected` and immediately triggers the same full triage pipeline — classification, investigation, and action proposal — as any automated alert. This is useful for escalating issues discovered through monitoring dashboards that do not yet have webhook integrations.
+
+## The `resolved` Path and Post-Mortem Generation
+
+When an incident reaches `resolved`, the system automatically triggers post-mortem generation. The LLM synthesizes:
+
+- **Root cause** — derived from the agent's investigation analysis
+- **Timeline** — reconstructed from `incident_events` timestamps
+- **MTTR** — computed from `detected` → `resolved` event delta
+- **Lessons learned** — recommendations based on the incident type and actions taken
+
+The post-mortem is stored as a document in the `incidents-{domain}` ChromaDB collection (episodic memory), making it retrievable for future incidents with similar signatures. It is also surfaced in the dashboard under the incident detail view.
+
+## The `failed` Path
+
+An incident transitions to `failed` in three situations:
+
+1. **Action rejected by guardrail** — the proposed command did not match any allowed pattern, so `proposed_action` is cleared and the incident cannot proceed past `analyzed`.
+2. **Execution error** — the command ran but returned a non-zero exit code or threw an exception.
+3. **Pipeline exception** — any unhandled error in the supervisor (network timeout, OpenAI outage, Supabase connectivity issue) is caught by the top-level `except` block, which writes `status: failed` and stores the error message in `action_error` for debugging.
+
+A failed incident is terminal — Sentinel will not retry automatically. Engineers can manually re-trigger triage from the dashboard after addressing the underlying cause.

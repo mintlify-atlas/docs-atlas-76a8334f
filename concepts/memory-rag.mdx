@@ -1,0 +1,280 @@
+---
+title: "ChromaDB Memory and RAG Runbook Retrieval in Sentinel"
+sidebarTitle: "Memory & RAG"
+description: "How Sentinel uses ChromaDB for two memory layers: RAG-based runbook retrieval for investigation, and episodic memory for finding similar past incidents."
+---
+
+Sentinel uses ChromaDB as a dual-purpose memory system. The first layer holds curated runbooks — human-written procedures for handling known incident types — and is queried during investigation to ground the agent's reasoning in operational best practices. The second layer is episodic memory: an automatically growing collection of resolved incidents that lets the agent ask "has something like this happened before, and what worked?". Both layers are domain-separated into dedicated collections, keeping Docker context out of PostgreSQL queries and vice versa.
+
+## Two Memory Layers
+
+<CardGroup cols={2}>
+  <Card title="Runbook RAG" icon="book-open">
+    Static, curated knowledge. Human-written Markdown procedures seeded before the system starts. Agents query this before invoking any tools.
+  </Card>
+  <Card title="Episodic Memory" icon="clock-rotate-left">
+    Dynamic, self-growing knowledge. Every resolved incident is written here automatically. Agents query this to surface historical patterns.
+  </Card>
+</CardGroup>
+
+---
+
+## Layer 1 — Runbook RAG
+
+### Collection Convention
+
+Runbooks are stored in collections named `runbooks-{domain}`. There are four domain collections:
+
+| Collection | Domain Agent | Contents |
+|---|---|---|
+| `runbooks-docker` | DockerAgent | Restart procedures, log analysis, OOM handling, network debugging for Docker containers |
+| `runbooks-podman` | PodmanAgent | Podman-specific restart and investigation procedures |
+| `runbooks-kubernetes` | KubernetesAgent | Pod eviction, deployment rollout, CrashLoopBackOff, resource quota procedures |
+| `runbooks-postgres` | PostgresAgent | Connection pooling, deadlock resolution, vacuum, query cancellation, replication lag |
+
+### Query Function
+
+```python
+# services/agents/memory/runbooks.py
+
+def query_runbooks(collection_name: str, query: str, k: int = 3) -> list[str]:
+    """
+    Returns the k most relevant runbook documents for a query.
+    Returns only text — LLMs do not need runbook metadata.
+    """
+    collection = get_or_create_collection(collection_name)
+    results = collection.query(query_texts=[query], n_results=k)
+    return results.get("documents", [[]])[0] or []
+```
+
+Agents call this via the `DomainAgent` base class helper:
+
+```python
+def recall_runbooks(self, query: str, k: int = 3) -> list[str]:
+    from services.agents.memory.runbooks import query_runbooks
+    return query_runbooks(self.runbooks_collection, query, k=k)
+```
+
+### Query Construction
+
+Each agent queries runbooks at the start of `investigate()`, before any tool calls. The query string is constructed as:
+
+```python
+query = f"{ctx.incident_type} {ctx.title}"
+# Example: "app_crash api-gateway container exited with code 137"
+```
+
+The default `k=5` at the agent level retrieves the five most relevant runbook chunks, which are included in the agent's LLM context alongside the incident details and tool call results.
+
+### Seeding Runbooks
+
+Runbook documents are loaded from Markdown files using `seed_*.py` scripts (one per domain). Each script reads the Markdown files, splits them into chunks, and upserts them into the appropriate ChromaDB collection. Seeding is idempotent — running the seed script again updates existing documents rather than creating duplicates.
+
+<Tip>
+Re-run the seed scripts whenever you add or update runbook Markdown files. ChromaDB uses embeddings generated at seed time, so new content is not automatically indexed. After adding a new runbook for, say, Kubernetes `PodDisruptionBudget` violations, run `python scripts/seed_kubernetes.py` to make it retrievable.
+</Tip>
+
+---
+
+## Layer 2 — Episodic Memory
+
+### Collection Convention
+
+Past incidents are stored in collections named `incidents-{domain}`. The four domain collections mirror the runbook collections:
+
+| Collection | Domain Agent | Contents |
+|---|---|---|
+| `incidents-docker` | DockerAgent | All investigated Docker container incidents |
+| `incidents-podman` | PodmanAgent | All investigated Podman container incidents |
+| `incidents-kubernetes` | KubernetesAgent | All investigated Kubernetes workload incidents |
+| `incidents-postgres` | PostgresAgent | All investigated PostgreSQL database incidents |
+
+### Writing to Episodic Memory
+
+After each investigation, the supervisor calls `agent.remember_incident(ctx, result)`, which delegates to:
+
+```python
+# services/agents/memory/incidents.py
+
+def store_incident(
+    collection_name: str,
+    ctx: "IncidentContext",
+    result: "InvestigationResult",
+) -> None:
+    """
+    Saves an investigated incident to the domain's episodic memory.
+    Idempotent: upserts by incident_id, so re-running does not duplicate.
+    """
+    collection = get_or_create_collection(collection_name)
+
+    # The embedded document — what gets matched by semantic search
+    doc = (
+        f"Título: {ctx.title}\n"
+        f"Tipo: {ctx.incident_type or 'unknown'}\n"
+        f"Target: {ctx.target}\n"
+        f"Severidad: {ctx.severity}\n\n"
+        f"{result.analysis[:1500]}"   # first 1500 chars of analysis
+    )
+
+    metadata = {
+        "incident_id":    ctx.incident_id,
+        "title":          ctx.title,
+        "target":         ctx.target,
+        "severity":       ctx.severity,
+        "incident_type":  ctx.incident_type or "unknown",
+        "tools_used":     ",".join(tc.name for tc in result.tool_calls),
+        "stored_at":      datetime.now(tz=timezone.utc).isoformat(),
+    }
+
+    collection.upsert(ids=[ctx.incident_id], documents=[doc], metadatas=[metadata])
+```
+
+The document embeds the title, type, target, severity, and a 1,500-character excerpt of the agent's analysis. This combination gives ChromaDB strong semantic signals to match against future incidents.
+
+### Querying Episodic Memory
+
+During a new investigation, agents query the episodic collection before running tools:
+
+```python
+# services/agents/memory/incidents.py
+
+def query_incidents(collection_name: str, query: str, k: int = 3) -> list[dict]:
+    """
+    Returns the k most similar past incidents.
+    Filters out results with cosine distance > 1.5 (too dissimilar to be useful).
+    Each result: { id, document, metadata, distance }
+    """
+    collection = get_or_create_collection(collection_name)
+    results = collection.query(
+        query_texts=[query],
+        n_results=k,
+        include=["documents", "metadatas", "distances"],
+    )
+    # Distance filter: only return semantically close matches
+    out = []
+    for i, d, m, dist in zip(ids, docs, metas, dists):
+        if dist is not None and dist > 1.5:
+            continue
+        out.append({"id": i, "document": d, "metadata": m or {}, "distance": dist})
+    return out
+```
+
+Agents call this via the base class helper, with `k=6` at the supervisor level:
+
+```python
+def recall_similar_incidents(self, query: str, k: int = 3) -> list[dict]:
+    from services.agents.memory.incidents import query_incidents
+    return query_incidents(self.incidents_collection, query, k=k)
+```
+
+The returned dicts are passed to the agent's LLM context as `similar_past_incidents` and are also surfaced in the `InvestigationResult` so the supervisor can log how many similar incidents were found.
+
+---
+
+## Domain Routing
+
+Both memory layers are keyed to the same domain name as the agent. The domain is determined by the supervisor before routing, using `ctx.labels`:
+
+```python
+# Routing logic (simplified from supervisor + DomainAgent.matches()):
+
+if ctx.labels.get("source_type") == "database":
+    domain = "postgres"
+elif ctx.labels.get("container_runtime") == "podman":
+    domain = "podman"
+elif ctx.labels.get("container_runtime") == "kubernetes":
+    domain = "kubernetes"
+else:
+    domain = "docker"   # default for container_runtime=docker or unset
+
+# Resulting collection names:
+runbooks_collection  = f"runbooks-{domain}"   # e.g. "runbooks-kubernetes"
+incidents_collection = f"incidents-{domain}"  # e.g. "incidents-kubernetes"
+```
+
+This separation means a PostgreSQL incident never retrieves Docker runbooks, and a Kubernetes CrashLoopBackOff incident does not surface Podman episodic memories. Each agent only sees the context relevant to its domain.
+
+---
+
+## The ChromaDB Client
+
+All collection access goes through a single shared client defined in `chroma_client.py`:
+
+```python
+# services/agents/memory/chroma_client.py
+
+def get_client():
+    """HTTP connection to ChromaDB (process-level singleton)."""
+    global _client
+    if _client is not None:
+        return _client
+    import chromadb
+    chroma_url = os.getenv("CHROMA_HOST", "http://localhost:8001")
+    parsed = urlparse(chroma_url)
+    _client = chromadb.HttpClient(host=parsed.hostname, port=parsed.port or 8001)
+    return _client
+
+def get_or_create_collection(name: str):
+    """Returns the collection, creating it if it does not exist."""
+    return get_client().get_or_create_collection(name)
+```
+
+Key characteristics:
+- **Singleton** — one `HttpClient` per process, reused across all memory calls
+- **HTTP mode** — connects to a running ChromaDB server (configured via `CHROMA_HOST` env var)
+- **Lazy import** — `chromadb` is not imported at module load time, avoiding Pydantic v1 conflicts with LangGraph
+- **Get-or-create** — collections are created on first access; no manual provisioning required beyond seeding
+
+---
+
+## Memory Write: Best-Effort with Timeout
+
+Writing to episodic memory is non-blocking. The supervisor wraps the `remember_incident` call in a `ThreadPoolExecutor` with an 8-second timeout:
+
+```python
+# supervisor.py
+_MEMORY_WRITE_TIMEOUT_SEC = 8
+
+pool = ThreadPoolExecutor(max_workers=1)
+try:
+    future = pool.submit(agent.remember_incident, ctx, result)
+    future.result(timeout=_MEMORY_WRITE_TIMEOUT_SEC)
+    pool.shutdown(wait=False, cancel_futures=True)
+except FutureTimeoutError:
+    pool.shutdown(wait=False, cancel_futures=True)
+    logger.warning(f"Timeout guardando memoria para {ctx.incident_id[:8]}; continuo")
+except Exception as e:
+    pool.shutdown(wait=False, cancel_futures=True)
+    logger.warning(f"Error guardando memoria para {ctx.incident_id[:8]}: {e}")
+```
+
+If ChromaDB is slow or unreachable, the memory write is abandoned after 8 seconds. The incident triage result is already persisted in Supabase at this point — the memory write failure is logged as a warning but does not affect the incident status or the engineer's view.
+
+---
+
+## All 8 ChromaDB Collections
+
+| Collection | Type | Domain | Populated by |
+|---|---|---|---|
+| `runbooks-docker` | Runbook RAG | Docker | `seed_docker.py` |
+| `runbooks-podman` | Runbook RAG | Podman | `seed_podman.py` |
+| `runbooks-kubernetes` | Runbook RAG | Kubernetes | `seed_kubernetes.py` |
+| `runbooks-postgres` | Runbook RAG | PostgreSQL | `seed_postgres.py` |
+| `incidents-docker` | Episodic Memory | Docker | Auto-written on investigation |
+| `incidents-podman` | Episodic Memory | Podman | Auto-written on investigation |
+| `incidents-kubernetes` | Episodic Memory | Kubernetes | Auto-written on investigation |
+| `incidents-postgres` | Episodic Memory | PostgreSQL | Auto-written on investigation |
+
+## Why Two Separate Layers
+
+The split between runbooks and episodic memory is intentional:
+
+| | Runbook RAG | Episodic Memory |
+|---|---|---|
+| **Content** | Canonical procedures (how to handle OOM, deadlock, etc.) | Specific past incidents (what actually happened on `api-gateway` on 2024-03-15) |
+| **Author** | Human SREs | Sentinel (auto-generated) |
+| **Growth** | Manual (seed scripts) | Automatic (every investigation) |
+| **Query goal** | "What's the procedure for this?" | "Has this exact pattern occurred before?" |
+| **Retrieval value** | Grounds reasoning in best practices | Surfaces proven solutions for recurring issues |
+
+Runbooks answer procedural questions. Episodic memory answers pattern-recognition questions. Providing both to the investigating agent produces richer, more contextual analyses than either layer alone.

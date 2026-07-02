@@ -1,0 +1,127 @@
+---
+title: "Sentinel REST API Overview"
+sidebarTitle: "Overview"
+description: "Base URLs, request/response format, authentication method, pagination, and error codes for the Sentinel SoftServe FastAPI backend."
+---
+
+The Sentinel SoftServe REST API is a FastAPI-based backend that powers the agentic incident triage co-pilot. All resources — incidents, actions, alerts, and health checks — are exposed under a versioned `/api/` prefix and communicate exclusively in JSON. This page covers the base URLs, authentication model, pagination contract, error format, and a full index of every available endpoint.
+
+## Base URLs
+
+| Environment | Base URL |
+|---|---|
+| Local development | `http://localhost:8000` |
+| Production (Render) | `https://sentinel-softserve.onrender.com` |
+
+Interactive Swagger UI documentation is available at `/docs`:
+
+- **Local:** `http://localhost:8000/docs`
+- **Production:** `https://sentinel-softserve.onrender.com/docs`
+
+## Request & Response Format
+
+Every request body and every response body is JSON. Set the `Content-Type: application/json` header on all `POST`, `PATCH`, and `PUT` requests. Responses always include an appropriate HTTP status code alongside the JSON body.
+
+## Authentication
+
+All endpoints under `/api/` — with the exception of `POST /api/alerts` and `GET /api/health` — require a valid Supabase JWT passed as a Bearer token:
+
+```
+Authorization: Bearer <supabase-jwt-token>
+```
+
+See the [Authentication](/api/authentication) page for full details on obtaining and using tokens.
+
+## All Endpoints Prefix
+
+Every application endpoint is mounted under the `/api/` prefix. The only exception is the bare liveness probe `GET /health`, which lives at the root and requires no authentication.
+
+## Pagination
+
+List endpoints accept two query parameters for pagination:
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `page` | integer | `1` | 1-based page number |
+| `limit` | integer | `20` | Number of records per page |
+
+Every paginated response follows this envelope:
+
+```json
+{
+  "data": [...],
+  "total": 42,
+  "page": 1,
+  "limit": 20,
+  "pages": 3
+}
+```
+
+<Note>
+  `pages` is computed as `ceil(total / limit)` and will be `0` when there are no results.
+</Note>
+
+## Error Format
+
+All error responses use a consistent structure:
+
+```json
+{
+  "detail": "human-readable error message"
+}
+```
+
+## HTTP Status Codes
+
+| Code | Meaning |
+|---|---|
+| `200 OK` | Request succeeded |
+| `201 Created` | Resource created successfully |
+| `400 Bad Request` | Invalid input or malformed request body |
+| `401 Unauthorized` | Missing, invalid, or expired JWT |
+| `404 Not Found` | Resource does not exist |
+| `409 Conflict` | Duplicate action execution or status transition conflict |
+| `503 Service Unavailable` | Prometheus metrics unreachable and no cached snapshot available |
+
+## Endpoint Index
+
+The table below lists every endpoint exposed by the Sentinel API.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/incidents` | List incidents with filters and pagination |
+| `POST` | `/api/incidents` | Create a manual incident |
+| `GET` | `/api/incidents/{id}` | Get a single incident by UUID |
+| `PATCH` | `/api/incidents/{id}/status` | Update incident status |
+| `GET` | `/api/incidents/{id}/post-mortem` | Retrieve (or generate) post-mortem |
+| `PUT` | `/api/incidents/{id}/post-mortem` | Save or update post-mortem content |
+| `GET` | `/api/incidents/{id}/export` | Export incident as JSON or Markdown |
+| `GET` | `/api/incidents/{id}/runbooks` | Retrieve relevant runbooks from ChromaDB |
+| `GET` | `/api/incidents/{id}/similar` | Find similar past incidents via episodic memory |
+| `GET` | `/api/incidents/{id}/metrics` | Get live Prometheus metrics for the incident target |
+| `POST` | `/api/execute-action` | Execute the proposed remediation action |
+| `POST` | `/api/incidents/{id}/reject` | Reject the proposed action |
+| `POST` | `/api/incidents/{id}/postpone` | Postpone the proposed action |
+| `POST` | `/api/alerts` | Receive Alertmanager webhook notifications |
+| `GET` | `/api/health` | Full integration health check |
+| `GET` | `/health` | Simple liveness probe |
+
+## Explore by Section
+
+<CardGroup cols={2}>
+  <Card title="Authentication" icon="key" href="/api/authentication">
+    Supabase JWT Bearer tokens, HS256/ES256 validation, and the alerts webhook secret.
+  </Card>
+  <Card title="Incidents" icon="triangle-exclamation" href="/api/incidents">
+    List, create, update, export, and triage incidents with full filter and pagination support.
+  </Card>
+  <Card title="Actions" icon="bolt" href="/api/actions">
+    Execute, reject, or postpone AI-proposed remediation actions with atomic concurrency control.
+  </Card>
+  <Card title="Alerts" icon="bell" href="/api/alerts">
+    Receive Prometheus Alertmanager webhooks and automatically create incidents.
+  </Card>
+  <Card title="Health" icon="heart-pulse" href="/api/health">
+    Ping all six service dependencies and get an aggregate health status.
+  </Card>
+</CardGroup>

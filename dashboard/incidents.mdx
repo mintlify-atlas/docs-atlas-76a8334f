@@ -1,0 +1,143 @@
+---
+title: "Viewing and Managing Incidents in the Sentinel Dashboard"
+sidebarTitle: "Incidents"
+description: "How to view, filter, create, and export incidents in Sentinel. Covers incident cards, detail view, agent reasoning, metrics panel, timeline, runbooks, and similar incident matching."
+---
+
+Every incident Sentinel detects — whether triggered automatically by a Prometheus alert or created manually by an engineer — appears immediately in the left-hand incident list thanks to Supabase Realtime. This page covers how to browse and filter that list, understand what each incident card tells you, navigate the detail view, create incidents by hand, and export the full record for post-incident review.
+
+<Note>
+  Auto-detected incidents sourced from Prometheus Alertmanager appear in the list automatically without any manual action. The LangGraph pipeline begins processing them as soon as they are inserted into Supabase.
+</Note>
+
+## Filtering the Incident List
+
+The incident list header provides three filter tabs that control which incidents are shown:
+
+| Tab | What it shows |
+|---|---|
+| **Active** (`active`) | All incidents whose status is **not** `resolved` or `failed`, sorted by severity then recency |
+| **All** (`all`) | Every incident, grouped into active (sorted by severity) then resolved (sorted by recency) |
+| **Resolved** (`resolved`) | Only terminal incidents (`resolved` and `failed`), sorted by recency |
+
+The `active` alias is a derived filter — it is not a database status value. Switching tabs resets pagination to the first 20 results. A **Load more** button appears at the bottom when more incidents exist beyond the current page.
+
+## Incident Cards
+
+Each row in the list is rendered by `IncidentCard`. The card communicates everything you need to triage at a glance:
+
+- **Severity border** — a 3-px left border color-codes the severity: red (critical), orange (high), yellow (medium), green (low). Critical incidents also show a pulsing dot.
+- **Title** — truncated to 55 characters; hover for the full title.
+- **Target** — the resource name in monospace (e.g., `nginx-prod`, `postgres/app-db`).
+- **Runtime badge** — `docker`, `podman`, or `db` derived from `container_runtime` / `source_type`.
+- **Relative timestamp** — how long ago the incident was created (e.g., `3m`, `2h`, `1d`).
+- **Severity badge** — colored pill: Critical · High · Medium · Low.
+- **Status label** — the current pipeline stage in its accent color (blue through teal for active stages, emerald for resolved, red for failed).
+- **Approval indicator** — an animated cyan `⚡ Approve` chip pulses when `status === 'awaiting_approval'`, indicating immediate action is needed.
+- **MTTR chip** — for resolved incidents, shows the formatted mean time to recover (e.g., `4m 12s`).
+
+## Incident Detail View
+
+Clicking a card opens the full detail pane in Col 2 and the context panel in Col 3. The detail header shows:
+
+- Full incident title and target/server name
+- Severity, status, and runtime badges
+- A horizontal **StatusStepper** showing progress through all six pipeline stages (Detected → Investigating → Analyzed → Approval → Executing → Verifying) plus the terminal states (Resolved / Failed)
+- The **Export Incident** button
+- Creation timestamp
+
+Below the header, the scrollable body shows the proposed command (or executed command), execution stdout, error output, and the MTTR once resolved.
+
+### Context Panel Tabs
+
+The right-hand panel gives deeper context via five tabs:
+
+<CardGroup cols={2}>
+  <Card title="Agent Tab" icon="robot">
+    Renders `AgentReasoningPanel` with the full LLM analysis from `agent_reasoning`. Sections include root cause, evidence, recommended actions, and urgency. While the agent is still working, a live pipeline-steps skeleton is shown with rotating status messages.
+  </Card>
+  <Card title="Metrics Tab" icon="chart-line">
+    Shows `MetricsPanel` with live Prometheus data for the incident's target, plus the raw container logs rendered with color-coded log levels (ERROR in red, WARN in yellow, DEBUG in gray, INFO in slate, timestamps in sky-blue).
+  </Card>
+  <Card title="Runbooks Tab" icon="book">
+    Shows `RunbookViewer` (ChromaDB-retrieved runbooks relevant to the incident) and `SimilarIncidentsCard` (past incidents matched semantically). Both panels support manual search to re-query ChromaDB with a custom keyword.
+  </Card>
+  <Card title="Timeline Tab" icon="clock">
+    Shows `IncidentTimeline` — a vertical event list sourced from the `incident_events` table, with each transition showing its exact timestamp, description, and tool calls extracted from `agent_reasoning`.
+  </Card>
+</CardGroup>
+
+## Creating a Manual Incident
+
+Use the **+ New** button in the incident list header (or press `⌘K → New Incident`) to open the `CreateIncidentModal` form.
+
+<Steps>
+  <Step title="Open the modal">
+    Click the **+ New** button in the top-right corner of the incident list, or open the Command Palette with `⌘K` and select **New Incident**. The modal can be dismissed at any time with the `Escape` key or by clicking the backdrop.
+  </Step>
+  <Step title="Enter the title">
+    Type a descriptive title (required, max 200 characters). Example: `nginx-prod not responding — upstream 502 errors`.
+  </Step>
+  <Step title="Select the resource type">
+    Choose the source type that best describes the affected resource:
+    - **Manual** — a general incident not tied to a specific runtime
+    - **Container** — a Docker, Podman, or Kubernetes workload
+    - **Database** — a PostgreSQL instance
+  </Step>
+  <Step title="Set the target">
+    Enter the resource identifier (required, max 100 characters). For containers use the container name (e.g., `api-gateway`). For databases use `engine/db-name` format (e.g., `postgres/orders`).
+  </Step>
+  <Step title="Choose a severity">
+    Select from the dropdown: `critical`, `high`, `medium`, or `low`. This severity is used to sort the active incident list and color-code the card.
+  </Step>
+  <Step title="Add optional context">
+    Paste relevant log snippets, error messages, or a description into the **Description / Context** field (max 5,000 characters). This text is included in the prompt sent to the LangGraph agent, making its analysis more precise.
+  </Step>
+  <Step title="Submit">
+    Click **Create Incident**. The API call is made to `POST /api/incidents/` with your Supabase JWT. On success the modal closes. The new incident appears in the list immediately via the Supabase Realtime subscription, and the LangGraph pipeline begins running in the background.
+  </Step>
+</Steps>
+
+### CreateIncidentModal Field Reference
+
+| Field | Required | Max length | Values |
+|---|---|---|---|
+| `title` | ✅ | 200 chars | Free text |
+| `target` | ✅ | 100 chars | Container name or `engine/db-name` |
+| `severity` | ✅ | — | `critical`, `high`, `medium`, `low` |
+| `source_type` | ✅ | — | `container`, `database`, `manual` |
+| `description` | ❌ | 5,000 chars | Free text / logs |
+
+## Exporting an Incident
+
+The **Export Incident** button in the detail header opens the `ExportModal`. Two formats are available:
+
+<Tabs>
+  <Tab title="JSON Export">
+    Calls `GET /api/incidents/{id}/export?format=json`. Returns a fully structured JSON object containing:
+
+    ```json
+    {
+      "metadata": { "id": "...", "title": "...", "severity": "...", "status": "..." },
+      "evidence": {
+        "logs": "...",
+        "metrics_snapshot": { ... },
+        "agent_reasoning": "..."
+      },
+      "timeline": [ { "status": "...", "occurred_at": "..." } ],
+      "decisions": { "proposed_action": "...", "approved_by": "..." },
+      "actions": { "action_result": "...", "action_error": "...", "executed_at": "..." },
+      "post_mortem": "..."
+    }
+    ```
+
+    The file is saved as `incident_<title>_<id-prefix>.json`.
+  </Tab>
+  <Tab title="Markdown Export">
+    Calls `GET /api/incidents/{id}/export?format=markdown`. Returns a human-readable Markdown report with the same sections as the JSON export, suitable for pasting into Confluence, Notion, or a GitHub issue.
+
+    The file is saved as `incident_<title>_<id-prefix>.md`.
+  </Tab>
+</Tabs>
+
+Both formats are generated server-side and streamed directly to the browser for immediate download. No server-side storage occurs at export time — the export is assembled on demand from the incident's database record.
