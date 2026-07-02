@@ -1,7 +1,7 @@
 ---
 title: "Health Check API: Monitor Sentinel Service Dependencies"
 sidebarTitle: "Health"
-description: "The GET /api/health endpoint pings all Sentinel dependencies — Prometheus, Loki, ChromaDB, Alertmanager, LangFuse, and Supabase — and returns an aggregate health status."
+description: "GET /api/health checks Prometheus, Loki, ChromaDB, Alertmanager, LangFuse, and Supabase and returns a healthy, degraded, or critical aggregate status."
 ---
 
 Sentinel exposes two health endpoints: a lightweight liveness probe at `GET /health` (root level) and a full integration health check at `GET /api/health`. The integration check pings all six external service dependencies with a 3-second timeout and returns an aggregate status that reflects the overall health of the system. Both endpoints require no authentication, making them suitable for use with uptime monitors, container health checks, and load balancer probes.
@@ -30,7 +30,7 @@ curl https://sentinel-softserve.onrender.com/health
 
 ## GET /api/health
 
-Full integration health check. Pings all six service dependencies in parallel, measures latency, and returns an aggregate status. Use this endpoint for dashboards, alerting, and diagnosing connectivity issues.
+Full integration health check. Pings all six service dependencies sequentially, measures latency, and returns an aggregate status. Use this endpoint for dashboards, alerting, and diagnosing connectivity issues.
 
 **Auth required:** No
 

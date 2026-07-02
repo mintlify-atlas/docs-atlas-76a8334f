@@ -1,7 +1,7 @@
 ---
-title: "Deploy Sentinel with Docker Compose"
+title: "Deploy the Full Sentinel Stack with Docker Compose"
 sidebarTitle: "Docker Compose"
-description: "Start the full Sentinel stack — backend, frontend, Prometheus, Alertmanager, Loki, ChromaDB, LangFuse, Grafana, and PostgreSQL demo — with a single docker compose up command."
+description: "Bring up the complete Sentinel infrastructure — backend, frontend, Prometheus, Loki, ChromaDB, LangFuse, and Grafana — with docker compose up."
 ---
 
 The `docker-compose.yml` at the root of the repository defines the entire Sentinel infrastructure. A single command boots all fourteen services — the FastAPI backend, the React frontend, the observability pipeline (Prometheus, Alertmanager, Loki, Promtail, Grafana), the AI layer (ChromaDB, LangFuse), and a demo PostgreSQL instance with its exporter — wired together on a shared Docker network.
@@ -56,7 +56,7 @@ Every service binds to `localhost` only. The table below lists the host port eac
 | `postgres-exporter` | `9187` | `9187` | http://localhost:9187 |
 | `podman-exporter` | `9882` | `9882` | http://localhost:9882 |
 | `chromadb` | `8001` | `8000` | http://localhost:8001 |
-| `grafana` | `3000` | `3000` | http://localhost:3000 |
+| `grafana` | `3000` | `3000` | http://localhost:3000 — credentials: `admin` / `sentinel123` |
 
 <Note>
 `langfuse-db` and `promtail` do not expose ports to the host — they are only accessible within the Docker network by their service names.

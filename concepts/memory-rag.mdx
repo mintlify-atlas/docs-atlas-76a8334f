@@ -107,24 +107,18 @@ def store_incident(
     """
     collection = get_or_create_collection(collection_name)
 
-    # The embedded document — what gets matched by semantic search
-    doc = (
-        f"Título: {ctx.title}\n"
-        f"Tipo: {ctx.incident_type or 'unknown'}\n"
-        f"Target: {ctx.target}\n"
-        f"Severidad: {ctx.severity}\n\n"
-        f"{result.analysis[:1500]}"   # first 1500 chars of analysis
-    )
-
+    tools_used = [tc.name for tc in result.tool_calls]
     metadata = {
-        "incident_id":    ctx.incident_id,
-        "title":          ctx.title,
-        "target":         ctx.target,
-        "severity":       ctx.severity,
-        "incident_type":  ctx.incident_type or "unknown",
-        "tools_used":     ",".join(tc.name for tc in result.tool_calls),
-        "stored_at":      datetime.now(tz=timezone.utc).isoformat(),
+        "incident_id":   ctx.incident_id,
+        "title":         ctx.title,
+        "target":        ctx.target,
+        "severity":      ctx.severity,
+        "incident_type": ctx.incident_type or "unknown",
+        "tools_used":    ",".join(tools_used),  # Chroma does not accept lists in metadata
+        "stored_at":     datetime.now(tz=timezone.utc).isoformat(),
     }
+
+    doc = _build_document(ctx, result)  # title + type + target + severity + analysis[:1500]
 
     collection.upsert(ids=[ctx.incident_id], documents=[doc], metadatas=[metadata])
 ```
@@ -150,8 +144,12 @@ def query_incidents(collection_name: str, query: str, k: int = 3) -> list[dict]:
         n_results=k,
         include=["documents", "metadatas", "distances"],
     )
-    # Distance filter: only return semantically close matches
     out = []
+    ids   = results.get("ids",       [[]])[0]
+    docs  = results.get("documents", [[]])[0]
+    metas = results.get("metadatas", [[]])[0]
+    dists = results.get("distances", [[]])[0]
+    # Distance filter: only return semantically close matches
     for i, d, m, dist in zip(ids, docs, metas, dists):
         if dist is not None and dist > 1.5:
             continue

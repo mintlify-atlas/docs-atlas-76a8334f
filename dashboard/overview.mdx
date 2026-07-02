@@ -1,7 +1,7 @@
 ---
 title: "Sentinel Dashboard: Real-Time Incident Management Interface"
 sidebarTitle: "Overview"
-description: "Tour of the Sentinel React dashboard — live incident feed, agent reasoning panel, metrics, timelines, command palette, and export capabilities powered by Supabase Realtime."
+description: "Tour of the Sentinel dashboard: live incident feed, agent reasoning, Prometheus metrics, runbooks, command palette, and export via Supabase Realtime."
 ---
 
 The Sentinel dashboard is the primary interface for managing DevOps incidents in real time. Built with React and backed by Supabase Realtime, it presents a live feed of all incidents, the LangGraph agent's full reasoning chain, Prometheus metrics, runbook recommendations, and a suite of tools for approving remediations and generating post-mortems — all without a page refresh.
@@ -60,7 +60,7 @@ INSERT events also trigger browser push notifications (if permission is granted)
     Parses the `agent_reasoning` Markdown field and renders it as a structured UI: an agent identity header (Docker / Kubernetes / Postgres / Podman), a tool-invocation chip list, a similar-incidents count, and each analysis section (root cause, evidence, recommended actions, urgency) in its own color-accented card. While the LLM is still writing, a live skeleton + animated pipeline steps are shown instead.
   </Card>
   <Card title="ApprovalBanner" icon="circle-check">
-    Appears at the top of the detail pane when `status === 'awaiting_approval'`. Displays the proposed shell command in a monospace block and provides three action buttons: **Approve & Execute**, **Reject**, and **Postpone 30 min**.
+    Appears at the top of the detail pane when `status === 'awaiting_approval'`. Displays the proposed shell command in a monospace block and provides three action buttons: **Reject**, **Postpone 30 min**, and **Approve & Execute**.
   </Card>
   <Card title="MetricsPanel" icon="chart-bar">
     Fetches live Prometheus data from `GET /api/incidents/{id}/metrics`. For container incidents it shows memory usage (MB + %), CPU %, network in/out (KB/s), and restart count in the last hour. For PostgreSQL incidents it shows connection count, database size, cache hit ratio, deadlocks per minute, and longest running transaction. Falls back to a historical `metrics_snapshot` stored at detection time if Prometheus is unavailable.

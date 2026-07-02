@@ -1,7 +1,7 @@
 ---
 title: "Docker Runtime: Incident Triage with DockerAgent"
 sidebarTitle: "Docker"
-description: "How Sentinel's DockerAgent investigates Docker container incidents using docker_inspect, docker_logs, docker_stats, and docker_ps — with automatic restart proposals."
+description: "Sentinel DockerAgent uses docker_inspect, docker_logs, docker_stats, and docker_ps to investigate container incidents and propose a restart or logs action."
 ---
 
 The **DockerAgent** is Sentinel's default runtime specialist for container incidents. It uses a bounded ReAct loop — up to four tool invocations — to gather live evidence from the Docker daemon, cross-reference the `runbooks-docker` ChromaDB collection, and recall similar past incidents before producing a structured markdown analysis. When the investigation concludes, the Supervisor proposes a safe, whitelisted action for human approval.
@@ -79,7 +79,7 @@ All four tools are **read-only**. They never modify container state. The DockerA
 | `docker_stats` | `container` | `string` | — | Container name or ID prefix |
 | `docker_ps` | *(none)* | — | — | Lists all containers |
 
-<Tip>
+<Note>
   If the Docker socket is unavailable (e.g. the backend is running outside of Docker or without the bind mount), every tool returns a graceful fallback message such as:
 
   ```
@@ -88,7 +88,7 @@ All four tools are **read-only**. They never modify container state. The DockerA
   ```
 
   The agent then produces its analysis using only the Loki logs and runbook content already in its context.
-</Tip>
+</Note>
 
 ## Action Proposals
 

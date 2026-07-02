@@ -1,7 +1,7 @@
 ---
 title: "Kubernetes Runtime: Pod and Deployment Incident Triage"
 sidebarTitle: "Kubernetes"
-description: "Sentinel's KubernetesAgent uses the official Python Kubernetes SDK to investigate pod failures, CrashLoopBackOff, OOMKills, and deployment issues with six read-only tools."
+description: "KubernetesAgent investigates pod and deployment failures with six read-only SDK tools and proposes kubectl delete pod or rollout restart for approval."
 ---
 
 The **KubernetesAgent** investigates Kubernetes workload incidents using the official Python `kubernetes` SDK. It supports the full range of pod failure modes — `CrashLoopBackOff`, `OOMKilled`, `ImagePullBackOff`, `Pending` due to resource constraints, and deployment replica mismatches — through six read-only tools that query the cluster's API server without modifying any state.
@@ -159,18 +159,13 @@ The Supervisor's `_build_proposed_action` function maps resource type and incide
     |-------------|-----------------|
     | Any deployment | `kubectl rollout restart deployment/<name> -n <namespace>` |
   </Tab>
-  <Tab title="Scale action">
-    In cases where the deployment should be scaled (e.g. scaling down a broken rollout), the action executor also accepts:
-
-    ```bash
-    kubectl scale deployment/<name> --replicas=<0-10> -n <namespace>
-    ```
-
-    This must be the exact proposed action value — the allowlist enforces `--replicas` between 0 and 10.
-  </Tab>
 </Tabs>
 
 The action executor in `routers/actions.py` validates commands with `_validate_kubernetes_command`, which rejects any token containing shell metacharacters (`;`, `&&`, `|`, `` ` ``, `$(`, `>`, `<`, `\n`) and enforces RFC 1123 name patterns via `^[a-z0-9][a-z0-9\-.]{0,251}[a-z0-9]$`.
+
+<Note>
+  The action validator also accepts `kubectl scale deployment/<name> --replicas=<0-10> -n <namespace>` as a valid command format (replicas must be an integer from 0 to 10). The Supervisor never auto-generates a scale proposal — this format is available only if an operator manually sets it as the `proposed_action` value on an incident record before approval.
+</Note>
 
 ## Simulating an Incident
 

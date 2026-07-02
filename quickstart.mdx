@@ -1,7 +1,7 @@
 ---
-title: "Get Started with Sentinel SoftServe"
+title: "Sentinel SoftServe: Local Setup and Quickstart Guide"
 sidebarTitle: "Quickstart"
-description: "Run Sentinel locally in under 10 minutes using Docker Compose. Covers cloning, environment setup, database schema, ChromaDB seeding, and your first incident simulation."
+description: "Run Sentinel locally with Docker Compose. Covers env setup, Supabase schema, ChromaDB seeding, and your first live incident simulation in under 10 minutes."
 ---
 
 This guide walks you through standing up a fully functional Sentinel instance on your local machine. By the end you will have the entire observability stack, the FastAPI backend, and the React dashboard running together — and you will trigger your first AI-driven incident triage with a single Docker command.
@@ -64,7 +64,7 @@ This guide walks you through standing up a fully functional Sentinel instance on
   <Step title="Apply the database schema">
     The Supabase schema lives in `supabase/migrations/`. For a **brand-new** Supabase project, open the SQL Editor in the Supabase dashboard and run each migration file in order:
 
-    ```
+    ```text
     supabase/migrations/0001_initial_schema.sql
     supabase/migrations/0002_production_hardening.sql
     ```

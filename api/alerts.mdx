@@ -1,7 +1,7 @@
 ---
-title: "Alerts Webhook: Receive Prometheus Alertmanager Notifications"
+title: "Alerts Webhook: Receive Prometheus Alertmanager Payloads"
 sidebarTitle: "Alerts"
-description: "How to configure Alertmanager to POST to Sentinel's /api/alerts webhook. Covers the webhook payload schema, authentication with ALERT_WEBHOOK_SECRET, and incident creation flow."
+description: "Configure Alertmanager to POST to /api/alerts. Covers payload schema, ALERT_WEBHOOK_SECRET authentication, and how firing alerts create Sentinel incidents."
 ---
 
 The Alerts webhook is the primary integration point between your Prometheus Alertmanager deployment and Sentinel SoftServe. When Alertmanager fires an alert, it POSTs the standard webhook payload to `/api/alerts`. Sentinel processes each `firing` alert, creates an incident in Supabase, and immediately kicks off the LangGraph agent pipeline as a background task. This page covers authentication, payload schema, label conventions, and an Alertmanager configuration example.

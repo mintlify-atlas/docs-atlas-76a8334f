@@ -1,7 +1,7 @@
 ---
 title: "Incident Lifecycle in Sentinel: From Alert to Post-Mortem"
 sidebarTitle: "Incident Lifecycle"
-description: "Walk through every status transition an incident goes through in Sentinel: detected, investigating, analyzed, awaiting_approval, executing_solution, verifying, resolved, and failed."
+description: "Sentinel's eight incident statuses from detected to resolved or failed, how each transition is triggered, and how the event log powers MTTR analysis."
 ---
 
 Every incident in Sentinel moves through a well-defined sequence of statuses, from the moment an alert arrives to the final post-mortem stored in memory. Each transition is driven by real system events — a classification completing, an engineer approving an action, a verification check passing — and every step is written to the `incident_events` table with a precise timestamp so you always have a full audit trail.

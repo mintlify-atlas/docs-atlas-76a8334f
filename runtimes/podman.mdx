@@ -1,7 +1,7 @@
 ---
 title: "Podman Runtime: Rootless Container Incident Triage"
 sidebarTitle: "Podman"
-description: "Configure Sentinel to monitor and triage Podman rootless containers using the Docker-compatible SDK via the Podman socket, without requiring the podman binary."
+description: "PodmanAgent uses the Docker SDK and Podman socket to triage rootless container incidents. Tools: podman_inspect, podman_logs, podman_stats, and podman_ps."
 ---
 
 The **PodmanAgent** handles alerts from Podman rootless containers. It uses the same Docker-compatible REST API that Podman exposes via its socket, which means no `podman` binary is required inside the backend container — only the Docker Python SDK pointed at the right socket path. The four read-only tools (`podman_inspect`, `podman_logs`, `podman_stats`, `podman_ps`) mirror the Docker tool interface but are wired to the Podman socket.

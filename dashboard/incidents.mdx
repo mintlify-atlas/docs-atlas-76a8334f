@@ -1,7 +1,7 @@
 ---
 title: "Viewing and Managing Incidents in the Sentinel Dashboard"
 sidebarTitle: "Incidents"
-description: "How to view, filter, create, and export incidents in Sentinel. Covers incident cards, detail view, agent reasoning, metrics panel, timeline, runbooks, and similar incident matching."
+description: "How to view, filter, create, and export incidents in Sentinel: incident cards, detail view, agent reasoning, metrics, timeline, and runbook matching."
 ---
 
 Every incident Sentinel detects — whether triggered automatically by a Prometheus alert or created manually by an engineer — appears immediately in the left-hand incident list thanks to Supabase Realtime. This page covers how to browse and filter that list, understand what each incident card tells you, navigate the detail view, create incidents by hand, and export the full record for post-incident review.
@@ -100,13 +100,13 @@ Use the **+ New** button in the incident list header (or press `⌘K → New Inc
 
 ### CreateIncidentModal Field Reference
 
-| Field | Required | Max length | Values |
-|---|---|---|---|
-| `title` | ✅ | 200 chars | Free text |
-| `target` | ✅ | 100 chars | Container name or `engine/db-name` |
-| `severity` | ✅ | — | `critical`, `high`, `medium`, `low` |
-| `source_type` | ✅ | — | `container`, `database`, `manual` |
-| `description` | ❌ | 5,000 chars | Free text / logs |
+| Field | Required | Max length | Default | Values |
+|---|---|---|---|---|
+| `title` | ✅ | 200 chars | — | Free text |
+| `target` | ✅ | 100 chars | — | Container name or `engine/db-name` |
+| `severity` | ❌ | — | `medium` | `critical`, `high`, `medium`, `low` |
+| `source_type` | ❌ | — | `manual` | `container`, `database`, `manual` |
+| `description` | ❌ | 5,000 chars | — | Free text / logs |
 
 ## Exporting an Incident
 

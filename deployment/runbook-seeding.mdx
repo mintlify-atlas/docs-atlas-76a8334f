@@ -1,7 +1,7 @@
 ---
-title: "Seed ChromaDB with Domain Runbooks"
+title: "Seed Sentinel's ChromaDB with Operational Runbooks"
 sidebarTitle: "Runbook Seeding"
-description: "Populate ChromaDB vector collections with domain-specific runbooks so Sentinel's agents can retrieve relevant remediation procedures during incident investigation."
+description: "Load Docker, PostgreSQL, Podman, and Kubernetes runbooks into ChromaDB so Sentinel's agents can retrieve relevant remediation steps via RAG during triage."
 ---
 
 Runbook seeding is the process of loading Markdown-formatted operational runbooks into ChromaDB as vector embeddings. During incident investigation, Sentinel's specialist agents query these collections using semantic similarity search — a technique called Retrieval-Augmented Generation (RAG) — to retrieve the most relevant remediation procedure for the incident at hand. Without seeding, the agents have no domain-specific runbook knowledge and will fall back on general LLM reasoning only.

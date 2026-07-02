@@ -1,7 +1,7 @@
 ---
-title: "Configure Sentinel Environment Variables"
+title: "Sentinel Backend and Frontend Environment Variable Reference"
 sidebarTitle: "Configuration"
-description: "All environment variables for the Sentinel backend and frontend, including Supabase credentials, OpenAI API key, LangFuse observability, CORS settings, and webhook authentication."
+description: "Every environment variable for the Sentinel backend and frontend: Supabase, OpenAI, LangFuse, CORS, webhook secret, PostgreSQL, and runtime sockets."
 ---
 
 Sentinel is configured entirely through environment variables. The backend reads from `Backend/.env` and the frontend reads from `Frontend/.env.local`. Neither file is committed to the repository — you must create them from the examples below before starting the application.
@@ -62,7 +62,7 @@ Sentinel is configured entirely through environment variables. The backend reads
     | Variable | Required | Default | Description |
     |---|---|---|---|
     | `CORS_ORIGINS` | No | `http://localhost:5173,http://127.0.0.1:5173` | Comma-separated list of allowed origins for browser requests |
-    | `CORS_ORIGIN_REGEX` | No | — | Optional regex pattern for dynamically matching allowed origins (e.g. `https://.*\.yourdomain\.com`) |
+    | `CORS_ORIGIN_REGEX` | No | `^http://(\d{1,3}\.){3}\d{1,3}:5173$` | Regex for dynamically matching allowed origins — the default permits any LAN IP on port 5173 |
 
     ### PostgreSQL (demo instance)
 

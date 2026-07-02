@@ -1,7 +1,7 @@
 ---
-title: "Actions API: Execute, Reject, and Postpone Incident Remediation"
+title: "Actions API: Execute, Reject, or Postpone Remediation"
 sidebarTitle: "Actions"
-description: "Reference for the three action endpoints in Sentinel: POST /api/execute-action to run a whitelisted command, and POST /api/incidents/{id}/reject and /postpone for human decisions."
+description: "Reference for Sentinel's three action endpoints: execute a whitelisted remediation command, reject a proposed action, or postpone it for later review."
 ---
 
 The Actions API gives human operators control over the remediation actions proposed by Sentinel's LangGraph agent. Once an incident reaches `awaiting_approval` status, an engineer can approve the action (executing it atomically), reject it (marking the incident `failed`), or postpone it (sending it back to `analyzed` for later review). All three endpoints require a Supabase JWT, and the caller's identity is recorded in the `approved_by` field for audit purposes.

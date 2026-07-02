@@ -1,7 +1,7 @@
 ---
 title: "Sentinel SoftServe: AI Copilot for DevOps Incident Triage"
 sidebarTitle: "Introduction"
-description: "Sentinel is a self-hosted agentic AI co-pilot that automates DevOps incident triage across Docker, Podman, Kubernetes, and PostgreSQL with human-in-the-loop approvals."
+description: "Sentinel is an agentic AI co-pilot automating DevOps incident triage across Docker, Podman, Kubernetes, and PostgreSQL with human-in-the-loop approvals."
 ---
 
 Sentinel SoftServe is an agentic AI co-pilot designed for DevOps and SRE engineers who need to move fast during production incidents. It watches your infrastructure continuously, automatically detects crashes, resource exhaustion, and service degradations, then orchestrates a full triage pipeline — from log collection and root-cause analysis to proposing a safe corrective action — all without requiring you to dig through dashboards manually. Every AI decision passes through a human-in-the-loop approval gate before any remediation command is executed on your infrastructure.
@@ -29,10 +29,10 @@ Sentinel is built from purpose-chosen components across every layer of the stack
 | AI Orchestration | LangGraph + LangChain |
 | LLM | OpenAI gpt-4o-mini |
 | Knowledge Base | ChromaDB (runbooks RAG + episodic memory) |
-| Auth & Database | Supabase (email/password, JWT, Realtime subscriptions) |
+| Auth & DB | Supabase (email/password, JWT, Realtime) |
 | Agent Observability | LangFuse v2 (self-hosted) |
 | Incident Detection | cAdvisor + Prometheus + Alertmanager |
-| Log Collection | Loki + Promtail |
+| Logs | Loki + Promtail |
 | Dashboards | Grafana |
 
 ## Supported runtimes

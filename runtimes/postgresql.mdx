@@ -1,7 +1,7 @@
 ---
 title: "PostgreSQL Runtime: Database Incident Triage"
 sidebarTitle: "PostgreSQL"
-description: "Sentinel's PostgresAgent investigates database incidents with pg_stat_activity, pg_cancel_backend, and pg_terminate_backend — with safe, targeted connection management."
+description: "PostgresAgent diagnoses database incidents via four pg_stat tools and proposes pg_terminate_backend, pg_cancel_backend, or pg_stat_activity for approval."
 ---
 
 The **PostgresAgent** is Sentinel's specialist for database incidents. It connects to PostgreSQL via `psycopg2`, queries the `pg_stat_*` system views, and produces a structured diagnosis of connection exhaustion, deadlocks, long-running transactions, replication lag, and cache hit ratio degradation. Every action it proposes is a safe, targeted operation — from read-only observation (`pg_stat_activity`) to graceful query cancellation (`pg_cancel_backend`) or full connection termination (`pg_terminate_backend`) — and all require explicit human approval before execution.

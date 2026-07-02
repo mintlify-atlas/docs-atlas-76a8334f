@@ -1,7 +1,7 @@
 ---
 title: "Guardrails: Safety and Security for the Sentinel Agent"
 sidebarTitle: "Guardrails"
-description: "How Sentinel's multi-layer guardrail system blocks prompt injection, enforces action whitelists, validates incident classifications, and scopes agent responses to DevOps topics."
+description: "How Sentinel's guardrail layer blocks prompt injection, enforces command whitelists, validates incident types, and keeps agent output scoped to DevOps."
 ---
 
 Sentinel operates with significant autonomy — it classifies incidents, executes tool calls, and proposes remediation commands. That autonomy requires strict boundaries. The guardrail system is the enforcement layer: a set of deterministic checks and a semantic LLM judge that together ensure the pipeline can never be manipulated into harmful behavior, no matter what appears in the logs it analyzes.

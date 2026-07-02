@@ -1,7 +1,7 @@
 ---
-title: "LangGraph Multi-Agent Pipeline: How Sentinel Triages Incidents"
+title: "Sentinel Multi-Agent Pipeline: How Incidents Are Triaged"
 sidebarTitle: "Agent Pipeline"
-description: "Deep-dive into Sentinel's five-stage LangGraph pipeline: input guardrails, classification, specialist investigation, decision planning, action execution, and post-mortem generation."
+description: "Sentinel's LangGraph pipeline: guardrails, LLM classification, specialist agent investigation, decision planning, and automatic post-mortem generation."
 ---
 
 When Sentinel receives an alert, it does not hand it to a single monolithic LLM. Instead, it routes the incident through a structured multi-agent pipeline built on LangGraph — each stage has a dedicated responsibility, defined inputs and outputs, and its own guardrail checkpoint. The result is a traceable, auditable triage process where every decision can be explained and every LLM call is logged to LangFuse.

@@ -1,7 +1,7 @@
 ---
-title: "Sentinel System Architecture and Agent Pipeline"
+title: "Sentinel SoftServe System Architecture and Agent Pipeline"
 sidebarTitle: "Architecture"
-description: "How Sentinel's LangGraph multi-agent pipeline, observability stack, and React dashboard work together to automate incident triage from alert to post-mortem."
+description: "How Sentinel's LangGraph agent pipeline, observability stack, and React dashboard automate incident triage from initial alert through post-mortem report."
 ---
 
 Sentinel is composed of five tightly integrated layers: a Prometheus-based observability stack that detects incidents, a Loki log-collection pipeline that gathers evidence, a FastAPI backend that orchestrates everything, a LangGraph multi-agent engine that performs the actual triage reasoning, and a React dashboard that surfaces results and captures human decisions in real time. This page explains how those layers connect, what each component does, and where you can find the code that implements each part.
@@ -10,7 +10,7 @@ Sentinel is composed of five tightly integrated layers: a Prometheus-based obser
 
 The sequence below shows every hop an incident takes from initial detection through post-mortem generation.
 
-```
+```text
 Docker / Podman / Kubernetes / PostgreSQL incident occurs
         |
 cAdvisor / postgres-exporter detects it
@@ -116,7 +116,7 @@ The React dashboard subscribes to Supabase Realtime for live incident updates. K
 
 ## Project structure
 
-```
+```text
 Sentinel-SoftServe/
 ├── docker-compose.yml
 ├── prometheus/                     # Alert rules + scraping config

@@ -1,7 +1,7 @@
 ---
-title: "Set Up the Sentinel Database Schema in Supabase"
+title: "Set Up Sentinel's Supabase Database Schema and Tables"
 sidebarTitle: "Database Setup"
-description: "Apply Sentinel's Supabase migrations to create the incidents and incident_events tables, indexes, RLS policies, and Realtime subscription required by the backend."
+description: "Run the two migration files to create the incidents and incident_events tables, indexes, and the Realtime subscription that the Sentinel backend requires."
 ---
 
 Sentinel stores every incident and its status-transition timeline in Supabase (PostgreSQL). The schema lives in `supabase/migrations/` and consists of two migration files that must be applied in order. The backend will fail to start correctly if the `incidents` table does not exist, so apply the migrations before running `docker compose up -d` for the first time.

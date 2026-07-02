@@ -1,7 +1,7 @@
 ---
 title: "Authenticate with the Sentinel API Using Supabase JWT"
 sidebarTitle: "Authentication"
-description: "How to obtain a Supabase JWT access token and pass it in the Authorization header for all Sentinel API requests. Covers email/password auth and the /api/alerts webhook secret."
+description: "Obtain a Supabase JWT and send it as a Bearer token on protected requests. Covers HS256 and ES256 validation, JWT payload fields, and the webhook secret."
 ---
 
 Sentinel uses Supabase as its identity provider. Every API request to a protected endpoint must carry a valid Supabase JSON Web Token (JWT) in the `Authorization` header. The backend validates the token signature, extracts the caller's identity, and attaches it to audit fields such as `approved_by` on actions. This page explains how to obtain a token, how the backend validates it, and how the separate webhook secret works for the Alertmanager integration.

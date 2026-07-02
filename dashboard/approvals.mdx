@@ -1,7 +1,7 @@
 ---
 title: "Approving and Rejecting Agent-Proposed Actions in Sentinel"
 sidebarTitle: "Approvals"
-description: "How Sentinel's human-in-the-loop approval flow works: reviewing the agent's reasoning and proposed action, then approving, rejecting, or postponing remediation."
+description: "How Sentinel's human-in-the-loop approval flow works: review the agent's proposed command, then approve, reject, or postpone the remediation action."
 ---
 
 Sentinel is designed around a human-in-the-loop model: the LangGraph agent investigates an incident and proposes a remediation command, but **an engineer must explicitly approve it** before any mutation occurs in the production environment. This page explains how the `ApprovalBanner` works, what each decision means, and what happens to the incident after you act.
@@ -70,7 +70,7 @@ The agent is only permitted to propose commands from a strict server-side whitel
 |---|---|
 | Docker | `docker restart <container>`, `docker logs <container>` |
 | Podman | `podman restart <container>`, `podman logs <container>` |
-| Kubernetes | `kubectl rollout restart deployment/<name> -n <namespace>`, `kubectl delete pod <name> -n <namespace>`, `kubectl scale deployment/<name> --replicas=N -n <namespace>` |
+| Kubernetes | `kubectl rollout restart deployment/<name> [-n <namespace>]`, `kubectl delete pod <name> [-n <namespace>]`, `kubectl scale deployment/<name> --replicas=N [-n <namespace>]` |
 | PostgreSQL | `pg_stat_activity <db>`, `pg_cancel_backend <db>`, `pg_terminate_backend <db>` |
 
 <Warning>
@@ -83,7 +83,7 @@ Once you approve, the backend executes the command via the appropriate runtime a
 
 <Tabs>
   <Tab title="Docker / Podman">
-    The command runs as a subprocess call on the host where the Sentinel backend is deployed. The `stdout` is stored in `action_result` and the `stderr` in `action_error`. After execution, the verification service inspects the container state to confirm it returned to `running`.
+    Docker commands run as a subprocess call on the host where the Sentinel backend is deployed. Podman commands are executed via the Docker SDK pointed at the rootless Podman socket (`PODMAN_HOST`). The `stdout` is stored in `action_result` and the `stderr` in `action_error`. After execution, the verification service inspects the container state to confirm it returned to `running`.
 
     ```bash
     # Example — what Sentinel executes server-side:
@@ -91,7 +91,7 @@ Once you approve, the backend executes the command via the appropriate runtime a
     ```
   </Tab>
   <Tab title="Kubernetes">
-    `kubectl` is invoked as a subprocess. If `K8S_PROXY_URL` is configured in the environment, the kubeconfig is set to proxy through that URL. `stdout` and `stderr` are captured the same way as Docker actions.
+    `kubectl` is invoked as a subprocess. If `K8S_PROXY_URL` is configured in the environment, the `--server` flag is injected to route through that URL. `stdout` and `stderr` are captured the same way as Docker actions.
 
     ```bash
     # Example:
@@ -99,7 +99,7 @@ Once you approve, the backend executes the command via the appropriate runtime a
     ```
   </Tab>
   <Tab title="PostgreSQL">
-    The psycopg2 driver executes the function directly against the target database using the `DB_DSN` connection string from the environment. No shell subprocess is involved.
+    The psycopg2 driver executes the function directly against the target database using the `POSTGRES_DSN` (or individual `POSTGRES_HOST` / `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` environment variables) connection string from the environment. No shell subprocess is involved.
 
     ```sql
     -- Example:
